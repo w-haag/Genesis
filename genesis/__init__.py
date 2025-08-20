@@ -76,7 +76,7 @@ def init(
         if debug:
             backend = gs_backend.cpu
         else:
-            backend = gs_backend.gpu
+            backend = gs_backend.vulkan
 
     # verbose repr
     global _verbose
