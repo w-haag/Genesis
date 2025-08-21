@@ -79,33 +79,29 @@ class HoverEnv:
         # add target
         if self.env_cfg["visualize_target"]:
             self.target = self.scene.add_entity(
-                morph=gs.morphs.Mesh(
-                    file="meshes/sphere.obj",
-                    scale=0.05,
-                    fixed=False,
-                    collision=False,
-                ),
-                surface=gs.surfaces.Rough(
-                    diffuse_texture=gs.textures.ColorTexture(
-                        color=(1.0, 0.5, 0.5),
-                    ),
-                ),
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.05, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.5, 0.5)))
             )
 
-            self.adversary = self.scene.add_entity(
-                morph = gs.morphs.Box(
-                    size=(0.25, 0.25, self.env_cfg["adv_box_h"]),
-                    fixed=False,
-                    collision=True
-                ),
-                surface=gs.surfaces.Rough(
-                    diffuse_texture=gs.textures.ColorTexture(
-                        color=(1.0, 0.0, 0.0),
-                    ),
-                ),
+            self.target_threshold_highlight = self.scene.add_entity(
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.051, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.5, 0.75, 0.5)))
             )
+            self.target_reached_highlight = self.scene.add_entity(
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.052, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.0, 1.0, 0.0)))
+            )
+            self.highlight_hide = torch.tensor([0.0, 0.0, -1.0], device=gs.device, dtype=gs.tc_float)
+
+            self.adversary = self.scene.add_entity(
+                morph = gs.morphs.Box(size=(0.25, 0.25, self.env_cfg["adv_box_h"]),fixed=False,collision=True),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.0, 0.0)))
+            )
+
         else:
             self.target = None
+            self.target_threshold_highlight = None
+            self.target_reached_highlight = None
             self.adversary = None
 
         # add camera
@@ -184,7 +180,6 @@ class HoverEnv:
         self.adv_f = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.adv_phi = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.adv_sinus = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
-        # self.adv_base_offset = torch.tensor([0.0, 0.0, -0.275], device=gs.device, dtype=gs.tc_float)
         z_off = -(self.env_cfg["z_margin"] + 0.5*self.env_cfg["adv_box_h"])
         self.adv_base_offset = torch.tensor([0.0, 0.0, z_off], device=gs.device, dtype=gs.tc_float)
         self.adv_collision = torch.zeros((self.num_envs,), device=gs.device, dtype=torch.bool)
@@ -282,6 +277,14 @@ class HoverEnv:
             self.adversary.set_pos(self.commands_adv + self.adv_base_offset, zero_velocity=True)
             adv_contact = self.adversary.get_contacts(with_entity=self.drone, exclude_self_contact=True)
             self.adv_collision = (adv_contact['penetration'] > 0).any(dim=1)
+        # per-env highlight
+        if self.target_threshold_highlight is not None:
+            near = (self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"])
+            # per-env positions: show at target when near, park far below otherwise
+            threshold_pos = torch.where(near.unsqueeze(1), self.commands_adv, self.highlight_hide)
+            reached_pos = torch.where(self._success_mask().unsqueeze(1), self.commands_adv, self.highlight_hide)
+            self.target_threshold_highlight.set_pos(threshold_pos, zero_velocity=True)
+            self.target_reached_highlight.set_pos(reached_pos, zero_velocity=True)
         self.scene.step()
 
         # update buffers
