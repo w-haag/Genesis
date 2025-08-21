@@ -32,6 +32,42 @@ class ObsStacker:
         out = self.buf.gather(1, idx[..., None].expand(-1, -1, self.D))  # [N,K,D]
         return out.reshape(self.N, self.K * self.D)  # [N, K·D]
 
+class MultiRateStacker:
+    def __init__(self, num_envs, obs_dim, K, device, group=3, max_horizon=None):
+        self.N, self.D, self.K, self.device = num_envs, obs_dim, K, device
+        self.offsets = torch.tensor(self._build_offsets(K, group, max_horizon), dtype=torch.long, device=device)
+        self.M = int(self.offsets[-1].item()) + 1
+        self.buf = torch.zeros(num_envs, self.M, obs_dim, device=device)
+        self.ptr = torch.zeros(num_envs, dtype=torch.long, device=device)
+            
+    @torch.no_grad()
+    def push(self, obs_t, done):
+        if done.any():
+            self.buf[done] = 0
+            self.ptr[done] = 0
+        self.ptr = (self.ptr + (~done).long()) % self.M
+        self.buf[torch.arange(self.N, device=self.device), self.ptr] = obs_t
+
+    @torch.no_grad()
+    def stacked(self):
+        idx = (self.ptr[:, None] - self.offsets[None, :]) % self.M
+        out = self.buf.gather(1, idx[..., None].expand(-1, -1, self.D))
+        return out.reshape(self.N, self.K * self.D)
+
+    def _build_offsets(K, group, max_horizon):
+        offs, stride, used = [0], 1, 0
+        cap = None if max_horizon is None else max(K, max_horizon)
+        for _ in range(1, K):
+            nxt = offs[-1] + stride
+            if cap is not None and nxt > cap:
+                nxt = cap
+            offs.append(nxt)
+            used += 1
+            if used == group:
+                stride <<= 1
+                used = 0
+        return offs
+
 class HoverEnv:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
         self.num_envs = num_envs
