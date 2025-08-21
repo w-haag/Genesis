@@ -194,6 +194,7 @@ class HoverEnv:
         self.m_vapp_err_cnt = torch.zeros(self.num_envs, device=gs.device)
         self.m_vtan_sum = torch.zeros(self.num_envs, device=gs.device)
         self.m_vtan_cnt = torch.zeros(self.num_envs, device=gs.device)
+        self.m_vtgt_sum = torch.zeros(self.num_envs, device=gs.device)
 
         self.stable_cnt = torch.zeros(self.num_envs, dtype=torch.int32, device=gs.device)   # counter of current stable frames
         self.n_stable   = int(round(self.env_cfg["stable_time_s"] / self.dt))               # amount of frames to be stable for success
@@ -334,6 +335,9 @@ class HoverEnv:
         self.m_vapp_err_cnt += mask.float()
         self.m_vtan_sum += torch.where(mask, v_tan.norm(dim=1), torch.zeros_like(d))
         self.m_vtan_cnt += mask.float()
+
+        self.m_vtgt_sum += self.tgt_vel.norm(dim=1)
+
 
         self.last_commands_adv = self.commands_adv
 
@@ -491,15 +495,18 @@ class HoverEnv:
         eps = 1e-6
         dm = (self.m_d_sum[envs_idx] / (self.m_step[envs_idx] + eps)).mean().item()
         ins = (self.m_inside_sum[envs_idx] / (self.m_step[envs_idx] + eps)).mean().item()
-        app = (self.m_vapp_err_sum[envs_idx] / (self.m_vapp_err_cnt[envs_idx] + eps)).mean().item()
-        vt  = (self.m_vtan_sum[envs_idx] / (self.m_vtan_cnt[envs_idx] + eps)).mean().item()
+        vapp = (self.m_vapp_err_sum[envs_idx] / (self.m_vapp_err_cnt[envs_idx] + eps)).mean().item()
+        vtan  = (self.m_vtan_sum[envs_idx] / (self.m_vtan_cnt[envs_idx] + eps)).mean().item()
+        vtgt = (self.m_vtgt_sum[envs_idx] / (self.m_step[envs_idx] + eps)).mean().item()
+
         self.extras["episode"]["metric_d_mean"] = dm
         self.extras["episode"]["metric_inside_succ_pct"] = ins
-        self.extras["episode"]["metric_v_app_err_near"] = app
-        self.extras["episode"]["metric_v_tan_near"] = vt
+        self.extras["episode"]["metric_v_app_err_near"] = vapp
+        self.extras["episode"]["metric_v_tan_near"] = vtan
+        self.extras["episode"]["metric_v_tgt_mean"] = vtgt
         self.extras["episode"]["metric_difficulty"] = torch.mean(self.difficulty).item()
         # clear for next episodes
-        for t in [self.m_d_sum, self.m_step, self.m_inside_sum, self.m_vapp_err_sum, self.m_vapp_err_cnt, self.m_vtan_sum, self.m_vtan_cnt]:
+        for t in [self.m_d_sum, self.m_step, self.m_inside_sum, self.m_vapp_err_sum, self.m_vapp_err_cnt, self.m_vtan_sum, self.m_vtan_cnt, self.m_vtgt_sum]:
             t[envs_idx] = 0
 
     def reset(self):
