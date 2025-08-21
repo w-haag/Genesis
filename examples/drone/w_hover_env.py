@@ -107,7 +107,7 @@ class HoverEnv:
         # add camera
         if self.env_cfg["visualize_camera"]:
             self.cam = self.scene.add_camera(
-                res=(1920, 1080),
+                res=(960, 540),
                 pos=(3.5, 0.0, 2.5),
                 lookat=(0, 0, 0.5),
                 fov=30,
@@ -582,6 +582,3 @@ class HoverEnv:
 
     def _reward_success(self):
         return self.success.to(self.rew_buf.dtype)
-
-
-#TODO der seed scheint nicht zu klappen, hist10_vel_xl hat andere testdaten als hist10_vel -> wieso ist das früher nicht aufgefallen
