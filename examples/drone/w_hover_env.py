@@ -92,16 +92,18 @@ class HoverEnv:
                 surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.0, 1.0, 0.0)))
             )
             self.highlight_hide = torch.tensor([0.0, 0.0, -1.0], device=gs.device, dtype=gs.tc_float)
-
-            self.adversary = self.scene.add_entity(
-                morph = gs.morphs.Box(size=(0.25, 0.25, self.env_cfg["adv_box_h"]),fixed=False,collision=True),
-                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.0, 0.0)))
-            )
-
         else:
             self.target = None
             self.target_threshold_highlight = None
             self.target_reached_highlight = None
+
+        # add adversary
+        if self.env_cfg.get("use_adversary", True):
+            self.adversary = self.scene.add_entity(
+                morph=gs.morphs.Box(size=(0.25, 0.25, self.env_cfg["adv_box_h"]), fixed=False, collision=True),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.0, 0.0)))
+            )
+        else:
             self.adversary = None
 
         # add camera
@@ -278,6 +280,7 @@ class HoverEnv:
 
         if self.target is not None:
             self.target.set_pos(self.commands_adv, zero_velocity=True)
+        if self.adversary is not None:
             self.adversary.set_pos(self.commands_adv + self.adv_base_offset, zero_velocity=True)
             adv_contact = self.adversary.get_contacts(with_entity=self.drone, exclude_self_contact=True)
             self.adv_collision = (adv_contact['penetration'] > 0).any(dim=1)
