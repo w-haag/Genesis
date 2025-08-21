@@ -213,8 +213,9 @@ class HoverEnv:
         difficulty = self.difficulty[envs_idx].unsqueeze(-1)
         adv_v = torch.rand((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float) * v_max * difficulty
         adv_f = torch.rand((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float) * f_max
-        adv_f.clamp_min(1e-3)
+        adv_f.clamp_min_(0.1)                                                                               # avoid huge amplitudes
         adv_a = adv_v / (2*math.pi*adv_f*math.sqrt(3))
+        adv_a[:, 2] = torch.minimum(adv_a[:, 2], (self.commands[envs_idx, 2] - self.env_cfg["z_margin"]).clamp_min(0.0))     # avoid dipping below ground
         adv_phi = torch.rand_like(self.adv_phi[envs_idx]) * 2 * math.pi
 
         self.adv_a[envs_idx] = adv_a
@@ -228,20 +229,28 @@ class HoverEnv:
         self.last_commands_adv[envs_idx] = self.commands_adv[envs_idx]
 
     def _resample_commands(self, envs_idx):
-        self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(envs_idx),), gs.device)
-        self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["pos_y_range"], (len(envs_idx),), gs.device)
-        self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["pos_z_range"], (len(envs_idx),), gs.device)
+        spawn_clearance = 0.2 #TODO param
 
-        self._resample_adv(envs_idx)
+        while(True):
+            self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(envs_idx),), gs.device)
+            self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["pos_y_range"], (len(envs_idx),), gs.device)
+            self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["pos_z_range"], (len(envs_idx),), gs.device)
+
+            self._resample_adv(envs_idx)
+
+            self.rel_pos[envs_idx] = self.commands_adv[envs_idx] - self.base_pos[envs_idx]
+            self.rel_pos[envs_idx].nan_to_num_(0.0, 1e6, -1e6) 
+
+            clearance_mask = self.rel_pos[envs_idx, :2].norm(dim=1) >= spawn_clearance
+            if clearance_mask.all():
+                break
+
+        self.last_rel_pos[envs_idx] = self.rel_pos[envs_idx]
+        self.rel_vel[envs_idx] = 0.0
 
         self.tgt_vel[envs_idx] = 0.0
         self.tgt_vel_est[envs_idx] = 0.0
         self.tgt_acc_est[envs_idx] = 0.0
-
-        self.rel_pos[envs_idx] = self.commands_adv[envs_idx] - self.base_pos[envs_idx]
-        self.rel_pos[envs_idx].nan_to_num_(0.0, 1e6, -1e6)
-        self.last_rel_pos[envs_idx] = self.rel_pos[envs_idx]
-        self.rel_vel[envs_idx] = 0.0
 
         self.update_approach_geometry(envs_idx)
         dist, _, vel_close, _ = self.app_geom
@@ -352,7 +361,7 @@ class HoverEnv:
         # update curriculum
         self.difficulty[self.crash_condition] -= self.env_cfg["adv_difficulty_delta_fail"]
         self.difficulty[self.success] += self.env_cfg["adv_difficulty_delta_success"]
-        torch.clamp(input=self.difficulty, min=self.env_cfg["adv_difficulty_min"], max=self.env_cfg["adv_difficulty_max"], out=self.difficulty)
+        self.difficulty.clamp_(self.env_cfg["adv_difficulty_min"], self.env_cfg["adv_difficulty_max"])
 
         # compute reward
         self.rew_buf[:] = 0.0
