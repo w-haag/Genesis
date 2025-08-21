@@ -174,7 +174,7 @@ class HoverEnv:
         self.prev_vel_close = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
 
         D = self.build_obs().shape[-1]
-        K = 15
+        K = self.env_cfg["obs_stacks"]
         self.stacker = ObsStacker(self.num_envs, D, K, gs.device)
         self.num_obs = D * K
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=gs.device, dtype=gs.tc_float)

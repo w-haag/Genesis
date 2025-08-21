@@ -69,6 +69,7 @@ def get_train_cfg(exp_name, max_iterations):
 def get_cfgs():
     env_cfg = {
         "num_actions": 4,
+        "obs_stacks" : 15,
         # termination
         "termination_if_roll_greater_than": 80,  # degree
         "termination_if_pitch_greater_than": 80,
