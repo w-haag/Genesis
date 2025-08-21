@@ -144,8 +144,7 @@ class HoverEnv:
         self.commands_adv = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)
         self.last_commands_adv = torch.zeros_like(self.commands)  # set after build()
 
-        self.difficulty = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-        self.max_mean_difficulty = 0.0
+        self.difficulty = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_float) * self.env_cfg["adv_difficulty_min"]
 
         self.actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
         self.last_actions = torch.zeros_like(self.actions)
@@ -352,7 +351,7 @@ class HoverEnv:
         # update curriculum
         self.difficulty[self.crash_condition] -= self.env_cfg["adv_difficulty_delta_fail"]
         self.difficulty[self.success] += self.env_cfg["adv_difficulty_delta_success"]
-        torch.clamp(input=self.difficulty, min=0.0, max=self.env_cfg["adv_difficulty_max"], out=self.difficulty)
+        torch.clamp(input=self.difficulty, min=self.env_cfg["adv_difficulty_min"], max=self.env_cfg["adv_difficulty_max"], out=self.difficulty)
 
         # compute reward
         self.rew_buf[:] = 0.0

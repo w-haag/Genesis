@@ -33,12 +33,10 @@ def main():
     log_dir = f"logs/{args.exp_name}"
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(open(f"logs/{args.exp_name}/cfgs.pkl", "rb"))
     env_cfg["episode_length_s"] = 60.0
-    env_cfg["retarget_frames"] = 10.0
-    env_cfg["termination_if_roll_greater_than"] = 180.0
-    env_cfg["termination_if_pitch_greater_than"] = 180.0
-    env_cfg["adv_difficulty_delta_success"] = 0.05
+    env_cfg["adv_difficulty_delta_success"] = 0.1
     env_cfg["adv_difficulty_delta_fail"] = 0.0
     env_cfg["adv_difficulty_max"] = 1.0
+    env_cfg["adv_difficulty_min"] = 0.0
     reward_cfg["reward_scales"] = {}
 
     # visualize the target

@@ -93,6 +93,7 @@ def get_cfgs():
         "adv_max_f": 1.0,
         "adv_box_h": 0.50,         # adversary box height (m)
         # curriculum
+        "adv_difficulty_min": 0.0,
         "adv_difficulty_max": 1.0,
         "adv_difficulty_delta_success": 0.01,
         "adv_difficulty_delta_fail": 0.1,
