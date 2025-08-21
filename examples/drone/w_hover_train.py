@@ -92,7 +92,7 @@ def get_cfgs():
         # adversary / platform+target movement
         "adv_max_v": 1.0,
         "adv_max_f": 1.0,
-        "adv_box_h": 0.50,         # adversary box height (m)
+        "adv_box_h": 0.25,         # adversary box height (m)
         # curriculum
         "adv_difficulty_min": 0.0,
         "adv_difficulty_max": 1.0,
