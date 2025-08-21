@@ -103,9 +103,9 @@ def get_cfgs():
         "z_margin": 0.05,                    # pad clearance [m]
         "tgo_cap": 3.0,                      # clamp for t_go [s]
         # success criteria
-        "max_rel_speed_mps": 0.08,
-        "max_tilt_deg":      7.5,
-        "stable_time_s":     0.40,
+        "max_rel_speed_mps": 0.2,
+        "max_tilt_deg":      10.0,
+        "stable_time_s":     0.10,
         "retarget_frames": 10,         # 100 ms at dt=0.01
     }
     obs_cfg = {
@@ -117,13 +117,13 @@ def get_cfgs():
     }
     reward_cfg = {
         "reward_scales": {
-            "approach":         100.0,
-            "tan_vel_align":    0.5,
-            "below_pad":        2.0,
-            "smooth":           1.0,
-            "ang_vel":          0.5,
+            "approach":         500.0,
+            "tan_vel_align":    1.0,
+            "below_pad":        100.0,
+            "smooth":           0.5,
+            "ang_vel":          0.25,
             "crash":            100.0,
-            "success":          1.0,
+            "success":          5.0,
         },
     }
     command_cfg = {
@@ -140,8 +140,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="drone-hovering")
     parser.add_argument("-v", "--vis", action="store_true", default=False)
-    parser.add_argument("-B", "--num_envs", type=int, default=8192)
-    parser.add_argument("--max_iterations", type=int, default=2001)
+    parser.add_argument("-B", "--num_envs", type=int, default=16384)
+    parser.add_argument("--max_iterations", type=int, default=5001)
     parser.add_argument("-R", "--resume_ckpt", type=int, default=0)
     args = parser.parse_args()
 
