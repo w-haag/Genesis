@@ -226,20 +226,23 @@ class HoverEnv:
 
     def _resample_commands(self, envs_idx):
         spawn_clearance = 0.2 #TODO param
+        todo = torch.ones(len(envs_idx), dtype=torch.bool, device=gs.device)
 
-        while(True):
-            self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(envs_idx),), gs.device)
-            self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["pos_y_range"], (len(envs_idx),), gs.device)
-            self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["pos_z_range"], (len(envs_idx),), gs.device)
+        while todo.any():
+            todo_idx = envs_idx[todo]
 
-            self._resample_adv(envs_idx)
+            self.commands[todo_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(todo_idx),), gs.device)
+            self.commands[todo_idx, 1] = gs_rand_float(*self.command_cfg["pos_y_range"], (len(todo_idx),), gs.device)
+            self.commands[todo_idx, 2] = gs_rand_float(*self.command_cfg["pos_z_range"], (len(todo_idx),), gs.device)
 
-            self.rel_pos[envs_idx] = self.commands_adv[envs_idx] - self.base_pos[envs_idx]
-            self.rel_pos[envs_idx].nan_to_num_(0.0, 1e6, -1e6) 
+            self._resample_adv(todo_idx)
 
-            clearance_mask = self.rel_pos[envs_idx, :2].norm(dim=1) >= spawn_clearance
-            if clearance_mask.all():
-                break
+            self.rel_pos[todo_idx] = self.commands_adv[todo_idx] - self.base_pos[todo_idx]
+            self.rel_pos[todo_idx].nan_to_num_(0.0, 1e6, -1e6) 
+
+            clearance_mask = self.rel_pos[todo_idx, :2].norm(dim=1) >= spawn_clearance
+            temp_todo = todo.clone() # for pytorch reasons...
+            todo[temp_todo] = ~clearance_mask
 
         self.last_rel_pos[envs_idx] = self.rel_pos[envs_idx]
         self.rel_vel[envs_idx] = 0.0
