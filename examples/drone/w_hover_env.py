@@ -7,7 +7,7 @@ from torch.nn import functional
 
 
 def gs_rand_float(lower, upper, shape, device):
-    return (upper - lower) * torch.rand(size=shape, device=device) + lower
+    return (upper - lower) * torch.rand(size=shape, device=device, dtype=gs.tc_float) + lower
 
 class ObsStacker:
     def __init__(self, num_envs, obs_dim, K, device):
@@ -225,14 +225,14 @@ class HoverEnv:
         self.crash_condition = torch.zeros(self.num_envs, dtype=torch.bool, device=gs.device)
 
         # metric accumulators
-        self.m_d_sum = torch.zeros(self.num_envs, device=gs.device)
-        self.m_step = torch.zeros(self.num_envs, device=gs.device)
-        self.m_inside_sum = torch.zeros(self.num_envs, device=gs.device)
-        self.m_vapp_err_sum = torch.zeros(self.num_envs, device=gs.device)
-        self.m_vapp_err_cnt = torch.zeros(self.num_envs, device=gs.device)
-        self.m_vtan_sum = torch.zeros(self.num_envs, device=gs.device)
-        self.m_vtan_cnt = torch.zeros(self.num_envs, device=gs.device)
-        self.m_vtgt_sum = torch.zeros(self.num_envs, device=gs.device)
+        self.m_d_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_step = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_inside_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_vapp_err_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_vapp_err_cnt = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_vtan_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_vtan_cnt = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_vtgt_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
 
         self.stable_cnt = torch.zeros(self.num_envs, dtype=torch.int32, device=gs.device)   # counter of current stable frames
         self.n_stable   = int(round(self.env_cfg["stable_time_s"] / self.dt))               # amount of frames to be stable for success
