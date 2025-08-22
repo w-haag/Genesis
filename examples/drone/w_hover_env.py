@@ -491,7 +491,7 @@ class HoverEnv:
         return d, u, vel_close, t_go
 
     def build_obs(self):
-        retarget_flag = 0.0 # will be set to 1.0 by the obs stacker when necessary
+        retarget_flag = torch.zeros((self.num_envs, 1), device=gs.device, dtype=gs.tc_float) # will be set to 1.0 by the obs stacker when necessary
 
         dist, target_vector, vel_close, t_go = self.app_geom
 
