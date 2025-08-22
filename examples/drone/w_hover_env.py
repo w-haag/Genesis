@@ -11,42 +11,55 @@ def gs_rand_float(lower, upper, shape, device):
 
 class ObsStacker:
     def __init__(self, num_envs, obs_dim, K, device):
-        self.N, self.D, self.K = num_envs, obs_dim, K
-        self.buf = torch.zeros(num_envs, K, obs_dim, device=device)
+        self.N, self.D, self.K, self.device = num_envs, obs_dim, K, device
+        self.rows = torch.arange(self.N, dtype=torch.long, device=device)
+        self.offsets = torch.arange(self.K, dtype=torch.long, device=self.device)
+        self.buf = torch.zeros(num_envs, K, obs_dim, dtype=gs.tc_float, device=device)
         self.ptr = torch.zeros(num_envs, dtype=torch.long, device=device)  # per-env write index
             
     @torch.no_grad()
     def push(self, obs_t, done):  # done: bool [N]
-        if done.any():
-            self.buf[done] = 0
-            self.ptr[done] = 0
         self.ptr = (self.ptr + (~done).long()) % self.K
-        self.buf[torch.arange(self.N, device=self.buf.device), self.ptr] = obs_t
+        self.buf[self.rows, self.ptr] = obs_t
+
+        if done.any():
+            self.ptr[done] = 0
+            obs_t_broadcast = obs_t[done].unsqueeze(1).expand(-1, self.K, -1)
+            self.buf[done] = obs_t_broadcast
+            self.buf[done, :, -1] = 1.0
+            self.buf[done, 0, -1] = 0.0
 
     @torch.no_grad()
     def stacked(self):
-        # gather K frames newest → oldest without roll/copy
-        r = torch.arange(self.K, device=self.buf.device)
-        # idx[i] = ptr[i] - r mod K
-        idx = (self.ptr[:, None] - r[None, :]) % self.K  # [N,K]
+        idx = (self.ptr[:, None] - self.offsets[None, :]) % self.K  # [N,K]
         out = self.buf.gather(1, idx[..., None].expand(-1, -1, self.D))  # [N,K,D]
         return out.reshape(self.N, self.K * self.D)  # [N, K·D]
+
+    @torch.no_grad()
+    def retarget(self, envs_idx):
+        self.buf[envs_idx, :, :18] = 0.0 # 18 = up to base quat
+        self.buf[envs_idx, :, -1] = 1.0
 
 class MultiRateStacker:
     def __init__(self, num_envs, obs_dim, K, device, group=3, max_horizon=None):
         self.N, self.D, self.K, self.device = num_envs, obs_dim, K, device
+        self.rows = torch.arange(self.N, dtype=torch.long, device=device)
         self.offsets = torch.tensor(self._build_offsets(K, group, max_horizon), dtype=torch.long, device=device)
         self.M = int(self.offsets[-1].item()) + 1
-        self.buf = torch.zeros(num_envs, self.M, obs_dim, device=device)
+        self.buf = torch.zeros(num_envs, self.M, obs_dim, dtype=gs.tc_float, device=device)
         self.ptr = torch.zeros(num_envs, dtype=torch.long, device=device)
             
     @torch.no_grad()
     def push(self, obs_t, done):
-        if done.any():
-            self.buf[done] = 0
-            self.ptr[done] = 0
         self.ptr = (self.ptr + (~done).long()) % self.M
-        self.buf[torch.arange(self.N, device=self.device), self.ptr] = obs_t
+        self.buf[self.rows, self.ptr] = obs_t
+
+        if done.any():
+            self.ptr[done] = 0
+            obs_t_broadcast = obs_t[done].unsqueeze(1).expand(-1, self.M, -1)
+            self.buf[done] = obs_t_broadcast
+            self.buf[done, :, -1] = 1.0
+            self.buf[done, 0, -1] = 0.0
 
     @torch.no_grad()
     def stacked(self):
@@ -54,9 +67,15 @@ class MultiRateStacker:
         out = self.buf.gather(1, idx[..., None].expand(-1, -1, self.D))
         return out.reshape(self.N, self.K * self.D)
 
+    @torch.no_grad()
+    def retarget(self, envs_idx):
+        self.buf[envs_idx, :, :18] = 0.0 # 18 = up to base quat
+        self.buf[envs_idx, :, -1] = 1.0
+
+    @staticmethod
     def _build_offsets(K, group, max_horizon):
         offs, stride, used = [0], 1, 0
-        cap = None if max_horizon is None else max(K, max_horizon)
+        cap = None if max_horizon is None else int(max_horizon)
         for _ in range(1, K):
             nxt = offs[-1] + stride
             if cap is not None and nxt > cap:
@@ -194,8 +213,6 @@ class HoverEnv:
         self.base_ang_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.base_euler = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
 
-        self.retarget_cooldown = torch.zeros(self.num_envs, dtype=torch.int32, device=gs.device)
-
         self.tgt_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.tgt_vel_est = torch.zeros_like(self.tgt_vel)
         self.tgt_acc_est = torch.zeros_like(self.tgt_vel)
@@ -295,7 +312,6 @@ class HoverEnv:
         self.prev_vel_close[envs_idx] = vel_close[envs_idx]
 
         self.stable_cnt[envs_idx] = 0
-        self.retarget_cooldown[envs_idx] = int(self.env_cfg["retarget_frames"])
         self.success[envs_idx] = False
 
     def step(self, actions):
@@ -428,20 +444,21 @@ class HoverEnv:
         self.extras["time_outs"][time_out_idx] = 1.0
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
 
+        # resample successful envs
+        envs_idx = torch.nonzero(self.success, as_tuple=False).flatten()
+        self._resample_commands(envs_idx)
+
         # compute observations
         obs_t = self.build_obs()
         obs_t = torch.nan_to_num(obs_t, nan=0.0, posinf=1e6, neginf=-1e6)
         obs_t = torch.clamp(obs_t, -100.0, 100.0)
         done = self.reset_buf.bool()
+        self.stacker.retarget(envs_idx)
         self.stacker.push(obs_t, done)        
         self.obs_buf = self.stacker.stacked()
 
         self.last_actions[:] = self.actions[:]
         self.extras["observations"]["critic"] = self.obs_buf
-
-        # resample successful envs
-        envs_idx = torch.nonzero(self.success, as_tuple=False).flatten()
-        self._resample_commands(envs_idx)
 
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
@@ -474,8 +491,7 @@ class HoverEnv:
         return d, u, vel_close, t_go
 
     def build_obs(self):
-        retarget_flag = (self.retarget_cooldown > 0).float().unsqueeze(1)
-        self.retarget_cooldown -= (self.retarget_cooldown > 0).int()
+        retarget_flag = 0.0 # will be set to 1.0 by the obs stacker when necessary
 
         dist, target_vector, vel_close, t_go = self.app_geom
 

@@ -108,7 +108,6 @@ def get_cfgs():
         "max_rel_speed_mps": 0.2,
         "max_tilt_deg":      10.0,
         "stable_time_s":     0.10,
-        "retarget_frames": 10,         # 100 ms at dt=0.01
     }
     obs_cfg = {
         "obs_scales": {
