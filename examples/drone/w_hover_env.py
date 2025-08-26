@@ -266,16 +266,16 @@ class HoverEnv:
         adv_v = torch.rand((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float) * v_max * difficulty
         adv_f = torch.rand((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float) * f_max
         adv_f.clamp_min_(0.1)                                                                               # avoid huge amplitudes
-        adv_a = adv_v / (2*math.pi*adv_f*math.sqrt(3))
+        adv_a = adv_v / (math.tau*adv_f*math.sqrt(3))
         adv_a[:, 2] = torch.minimum(adv_a[:, 2], (self.commands[envs_idx, 2] - self.env_cfg["z_margin"]).clamp_min(0.0))     # avoid dipping below ground
-        adv_phi = torch.rand_like(self.adv_phi[envs_idx]) * 2 * math.pi
+        adv_phi = torch.rand_like(self.adv_phi[envs_idx]) * math.tau
 
         self.adv_a[envs_idx] = adv_a
         self.adv_f[envs_idx] = adv_f
         self.adv_phi[envs_idx] = adv_phi
 
         t = self.episode_length_buf[envs_idx].unsqueeze(-1).to(self.adv_f.dtype) * self.dt
-        self.adv_sinus[envs_idx] = self.adv_a[envs_idx] * torch.sin(math.pi*2*self.adv_f[envs_idx]*t + self.adv_phi[envs_idx])
+        self.adv_sinus[envs_idx] = self.adv_a[envs_idx] * torch.sin(math.tau*self.adv_f[envs_idx]*t + self.adv_phi[envs_idx])
 
         self.commands_adv[envs_idx] = self.commands[envs_idx] + self.adv_sinus[envs_idx]
         self.last_commands_adv[envs_idx] = self.commands_adv[envs_idx]
@@ -322,7 +322,7 @@ class HoverEnv:
         # 14468 is hover rpm
         self.drone.set_propellels_rpm((1 + exec_actions * 0.8) * 14468.429183500699) #yes, that's the correct API function name
         # update target pos
-        self.adv_sinus = self.adv_a * torch.sin(math.pi*2*self.adv_f*self.episode_length_buf.unsqueeze(-1)*self.dt + self.adv_phi)
+        self.adv_sinus = self.adv_a * torch.sin(math.tau*self.adv_f*self.episode_length_buf.unsqueeze(-1)*self.dt + self.adv_phi)
         self.commands_adv = self.commands + self.adv_sinus
 
         meas_tgt_vel = (self.commands_adv - self.last_commands_adv) / self.dt
@@ -392,9 +392,9 @@ class HoverEnv:
 
         mask = d < sigma
         self.m_near_cnt += mask.float()
-        self.m_vapp_err_sum += torch.where(mask, (v_des - vel_close).abs(), torch.zeros_like(d))
-        self.m_vtan_sum += torch.where(mask, v_tan.norm(dim=1), torch.zeros_like(d))
-        self.m_angvel_sum += torch.where(mask, w_norm, torch.zeros_like(w_norm))
+        self.m_vapp_err_sum += torch.where(mask, (v_des - vel_close).abs(), 0.0)
+        self.m_vtan_sum += torch.where(mask, v_tan.norm(dim=1), 0.0)
+        self.m_angvel_sum += torch.where(mask, w_norm, 0.0)
 
         self.m_vtgt_sum += self.tgt_vel.norm(dim=1)
 
@@ -404,13 +404,13 @@ class HoverEnv:
 
         gravity_vector = transform_by_quat(self.world_z, inv_base_quat)
         torch.nan_to_num_(gravity_vector, 0.0, 1e6, -1e6)
-        self.tilt_deg = torch.acos(gravity_vector[:, 2].clamp(-1.0, 1.0)) * self.rad2deg
+        self.base_tilt_deg = torch.acos(gravity_vector[:, 2].clamp(-1.0, 1.0)) * self.rad2deg
 
         # check termination
         below_plane = self.base_pos[:, 2] < (self.commands_adv[:, 2] - self.env_cfg["z_margin"])
         adv_hard_hit = self.adv_collision & (~self._success_mask()) & below_plane
         self.crash_condition = (
-            (self.tilt_deg > self.env_cfg["termination_if_tilt_greater_than"])
+            (self.base_tilt_deg > self.env_cfg["termination_if_tilt_greater_than"])
             | (torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"])
             | (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
             | (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
@@ -599,7 +599,7 @@ class HoverEnv:
     def _success_mask(self):
         near  = self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"]
         slow  = self.rel_vel.norm(dim=1) < self.env_cfg["max_rel_speed_mps"]
-        level = self.tilt_deg < self.env_cfg["max_tilt_deg"]
+        level = self.base_tilt_deg < self.env_cfg["max_tilt_deg"]
         angvel  = self.base_ang_vel.norm(dim=1) < self.env_cfg["max_angvel_radps"]
         return near & slow & level & angvel
 
