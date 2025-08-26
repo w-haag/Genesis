@@ -245,10 +245,10 @@ class HoverEnv:
         self.m_d_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
         self.m_step = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
         self.m_inside_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_near_cnt = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
         self.m_vapp_err_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
-        self.m_vapp_err_cnt = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
         self.m_vtan_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
-        self.m_vtan_cnt = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_angvel_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
         self.m_vtgt_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
 
         self.stable_cnt = torch.zeros(self.num_envs, dtype=torch.int32, device=gs.device)   # counter of current stable frames
@@ -383,16 +383,17 @@ class HoverEnv:
         v_des = torch.clamp(self.env_cfg["approach_k"] * d, max=self.env_cfg["approach_v_cap"])
         sigma = max(self.env_cfg["near_gate_factor"] * self.env_cfg["at_target_threshold"], self.env_cfg["at_target_threshold"])
         v_tan = self.rel_vel - (self.rel_vel*u).sum(dim=1, keepdim=True)*u
+        w_norm = self.base_ang_vel.norm(dim=1)  # rad/s
 
         self.m_d_sum += d
         self.m_step  += 1
         self.m_inside_sum += (d < self.env_cfg["at_target_threshold"]).float()
 
         mask = d < sigma
+        self.m_near_cnt += mask.float()
         self.m_vapp_err_sum += torch.where(mask, (v_des - vel_close).abs(), torch.zeros_like(d))
-        self.m_vapp_err_cnt += mask.float()
         self.m_vtan_sum += torch.where(mask, v_tan.norm(dim=1), torch.zeros_like(d))
-        self.m_vtan_cnt += mask.float()
+        self.m_angvel_sum += torch.where(mask, w_norm, torch.zeros_like(w_norm))
 
         self.m_vtgt_sum += self.tgt_vel.norm(dim=1)
 
@@ -415,6 +416,7 @@ class HoverEnv:
             | (torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"])
             | (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
             | (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
+            | (torch.abs(self.base_ang_vel[:, 2]) > self.env_cfg["termination_if_angvel_greater_than"])
             | (self.base_pos[:, 2] < self.env_cfg["termination_if_close_to_ground"])
             | adv_hard_hit
         )
@@ -553,18 +555,20 @@ class HoverEnv:
         eps = 1e-6
         dm = (self.m_d_sum[envs_idx] / (self.m_step[envs_idx] + eps)).mean().item()
         ins = (self.m_inside_sum[envs_idx] / (self.m_step[envs_idx] + eps)).mean().item()
-        vapp = (self.m_vapp_err_sum[envs_idx] / (self.m_vapp_err_cnt[envs_idx] + eps)).mean().item()
-        vtan  = (self.m_vtan_sum[envs_idx] / (self.m_vtan_cnt[envs_idx] + eps)).mean().item()
+        vapp = (self.m_vapp_err_sum[envs_idx] / (self.m_near_cnt[envs_idx] + eps)).mean().item()
+        vtan  = (self.m_vtan_sum[envs_idx] / (self.m_near_cnt[envs_idx] + eps)).mean().item()
         vtgt = (self.m_vtgt_sum[envs_idx] / (self.m_step[envs_idx] + eps)).mean().item()
+        angvel = (self.m_angvel_sum[envs_idx] / (self.m_near_cnt[envs_idx] + eps)).mean().item()
 
         self.extras["episode"]["metric_d_mean"] = dm
         self.extras["episode"]["metric_inside_succ_pct"] = ins
         self.extras["episode"]["metric_v_app_err_near"] = vapp
         self.extras["episode"]["metric_v_tan_near"] = vtan
         self.extras["episode"]["metric_v_tgt_mean"] = vtgt
+        self.extras["episode"]["metric_angvel_near"] = angvel
         self.extras["episode"]["metric_difficulty"] = torch.mean(self.difficulty).item()
         # clear for next episodes
-        for t in [self.m_d_sum, self.m_step, self.m_inside_sum, self.m_vapp_err_sum, self.m_vapp_err_cnt, self.m_vtan_sum, self.m_vtan_cnt, self.m_vtgt_sum]:
+        for t in [self.m_d_sum, self.m_step, self.m_inside_sum, self.m_vapp_err_sum, self.m_near_cnt, self.m_vtan_sum, self.m_vtgt_sum, self.m_angvel_sum]:
             t[envs_idx] = 0
 
     def reset(self):
@@ -580,7 +584,8 @@ class HoverEnv:
         near  = self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"]
         slow  = self.rel_vel.norm(dim=1) < self.env_cfg["max_rel_speed_mps"]
         level = (self.base_euler[:, :2].abs() < self.env_cfg["max_tilt_deg"]).all(dim=1)
-        return near & slow & level
+        angvel  = self.base_ang_vel.norm(dim=1) < self.env_cfg["max_angvel_radps"]
+        return near & slow & level & angvel
 
     def _gaussian_gate(self, dist):
         decay_distance = self.env_cfg["near_gate_factor"] * self.env_cfg["at_target_threshold"]
@@ -630,8 +635,19 @@ class HoverEnv:
         return -smooth_rew
 
     def _reward_ang_vel(self):
-        angular_rew = torch.norm(self.base_ang_vel / 3.14159, dim=1)
-        return -angular_rew
+        w_free = self.env_cfg.get("max_angvel_radps", 1.5)
+        soft_margin = self.env_cfg.get("angvel_excess_margin_radps", 0.5)
+
+        w = self.base_ang_vel.abs()
+        yaw = w[:, 2]
+        w_excess = (w - w_free).clamp_min(0.0)
+
+        yaw_rew = functional.smooth_l1_loss(yaw, torch.zeros_like(yaw), beta=soft_margin, reduction="none")
+        angvel_rew = functional.smooth_l1_loss(w_excess, torch.zeros_like(w_excess), beta=soft_margin, reduction="none").sum(dim=1)
+
+        dist, _, _, _ = self.app_geom
+        gate = self._gaussian_gate(dist)
+        return -(gate * angvel_rew + yaw_rew)
 
     def _reward_crash(self):
         crash_rew = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)

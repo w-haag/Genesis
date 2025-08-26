@@ -77,6 +77,7 @@ def get_cfgs():
         "termination_if_x_greater_than": 3.0,
         "termination_if_y_greater_than": 3.0,
         "termination_if_z_greater_than": 3.0,
+        "termination_if_angvel_greater_than": 3.0,
         # base pose
         "base_init_pos": [0.0, 0.0, 1.5],
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
@@ -104,9 +105,11 @@ def get_cfgs():
         "near_gate_factor": 2.0,             # ties gate decay to target threshold
         "z_margin": 0.05,                    # pad clearance [m]
         "tgo_cap": 3.0,                      # clamp for t_go [s]
+        "angvel_excess_margin_radps": 0.5,
         # success criteria
         "max_rel_speed_mps": 0.2,
         "max_tilt_deg":      10.0,
+        "max_angvel_radps":  1.5,
         "stable_time_s":     0.10,
     }
     obs_cfg = {
