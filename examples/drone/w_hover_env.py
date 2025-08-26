@@ -595,7 +595,10 @@ class HoverEnv:
     # ------------ reward functions----------------
 
     def _reward_approach(self):
-        """Unified distance + radial speed shaping."""
+        # unified distance + radial speed shaping
+        # distance difference to target
+        # vel difference to closing velocity
+        # use potential to reward continuous motion toward goal instead of 'parking'
         dist, _, vel_close, _ = self.app_geom
         dist_prev, vel_close_prev = self.prev_dist, self.prev_vel_close
 
@@ -605,17 +608,16 @@ class HoverEnv:
         vel_soft_margin = 0.05 #TODO param
 
         def phi(dist, vel):
-            gate = self._gaussian_gate(dist)
             dist_target = torch.zeros_like(dist)
             vel_target = torch.clamp(k * dist, max=v_cap)
             dist_rew =  functional.smooth_l1_loss(dist, dist_target, beta=dist_soft_margin, reduction="none")
-            vel_rew = gate * functional.smooth_l1_loss(vel, vel_target, beta=vel_soft_margin, reduction="none")
+            vel_rew = functional.smooth_l1_loss(vel, vel_target, beta=vel_soft_margin, reduction="none")
             return dist_rew + vel_close_weight * vel_rew
 
         return phi(dist_prev, vel_close_prev) - phi(dist, vel_close)
 
     def _reward_tan_vel_align(self):
-        """Penalize tangential velocity near goal."""
+        # penalize tangential velocity near goal
         dist, u, _, _ = self.app_geom
         gate = self._gaussian_gate(dist)
         v_tan = self.rel_vel - (self.rel_vel * u).sum(dim=1, keepdim=True) * u
