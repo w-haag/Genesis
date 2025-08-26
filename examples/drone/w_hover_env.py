@@ -624,14 +624,6 @@ class HoverEnv:
         tangential_speed = v_tan.norm(dim=1)
         return -(gate * tangential_speed)
 
-    def _reward_below_pad(self):
-        """Penalize being below target plane near goal."""
-        dist, _, _, _ = self.app_geom
-        gate = self._gaussian_gate(dist)
-        z_margin = self.env_cfg["z_margin"]
-        is_below = (self.base_pos[:, 2] < (self.commands_adv[:, 2] - z_margin)).float()
-        return -(gate * is_below)
-
     def _reward_smooth(self):
         smooth_rew = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
         return -smooth_rew

@@ -123,7 +123,6 @@ def get_cfgs():
         "reward_scales": {
             "approach":         500.0,
             "tan_vel_align":    1.0,
-            "below_pad":        100.0,
             "smooth":           0.5,
             "ang_vel":          0.25,
             "crash":            100.0,
