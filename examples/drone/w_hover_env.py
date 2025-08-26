@@ -544,30 +544,48 @@ class HoverEnv:
 
         # fill extras
         self.extras["episode"] = {}
-        for key in self.episode_sums.keys():
-            self.extras["episode"]["rew_" + key] = (
-                torch.mean(self.episode_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
-            )
-            self.episode_sums[key][envs_idx] = 0.0
-
         eps = 1e-6
-        dm = (self.m_d_sum[envs_idx] / (self.m_step[envs_idx] + eps)).mean().item()
-        ins = (self.m_inside_sum[envs_idx] / (self.m_step[envs_idx] + eps)).mean().item()
-        vapp = (self.m_vapp_err_sum[envs_idx] / (self.m_near_cnt[envs_idx] + eps)).mean().item()
-        vtan  = (self.m_vtan_sum[envs_idx] / (self.m_near_cnt[envs_idx] + eps)).mean().item()
-        vtgt = (self.m_vtgt_sum[envs_idx] / (self.m_step[envs_idx] + eps)).mean().item()
-        angvel = (self.m_angvel_sum[envs_idx] / (self.m_near_cnt[envs_idx] + eps)).mean().item()
+        inv_step = 1.0 / (self.m_step[envs_idx] + eps)
+        inv_near = 1.0 / (self.m_near_cnt[envs_idx] + eps)
 
-        self.extras["episode"]["metric_d_mean"] = dm
-        self.extras["episode"]["metric_inside_succ_pct"] = ins
-        self.extras["episode"]["metric_v_app_err_near"] = vapp
-        self.extras["episode"]["metric_v_tan_near"] = vtan
-        self.extras["episode"]["metric_v_tgt_mean"] = vtgt
-        self.extras["episode"]["metric_angvel_near"] = angvel
-        self.extras["episode"]["metric_difficulty"] = torch.mean(self.difficulty).item()
+        rew_keys = list(self.episode_sums.keys())
+        if rew_keys:
+            rew_vals = torch.stack(
+                [self.episode_sums[k][envs_idx].mean() for k in rew_keys],
+                dim=0
+            ) / self.env_cfg["episode_length_s"]
+            rew_cpu = rew_vals.detach().cpu().tolist()
+        else:
+            rew_cpu = []
+
+        d_mean_t = (self.m_d_sum[envs_idx]          * inv_step).mean()
+        inside_t = (self.m_inside_sum[envs_idx]     * inv_step).mean()
+        vapp_t   = (self.m_vapp_err_sum[envs_idx]   * inv_near).mean()
+        vtan_t   = (self.m_vtan_sum[envs_idx]       * inv_near).mean()
+        vtgt_t   = (self.m_vtgt_sum[envs_idx]       * inv_step).mean()
+        angvel_t = (self.m_angvel_sum[envs_idx]     * inv_near).mean()
+        diff_t   = self.difficulty.mean()
+        stats = torch.stack([d_mean_t, inside_t, vapp_t, vtan_t, vtgt_t, angvel_t, diff_t])
+        stats_cpu = stats.detach().cpu().tolist()
+
+        ep = self.extras["episode"]
+        dm, ins, vapp, vtan, vtgt, angvel, diff = stats_cpu
+        ep["metric_d_mean"]          = dm
+        ep["metric_inside_succ_pct"] = ins
+        ep["metric_v_app_err_near"]  = vapp
+        ep["metric_v_tan_near"]      = vtan
+        ep["metric_v_tgt_mean"]      = vtgt
+        ep["metric_angvel_near"]     = angvel
+        ep["metric_difficulty"]      = diff
+        for k, v in zip(rew_keys, rew_cpu):
+            ep[f"rew_{k}"] = v
+
+
         # clear for next episodes
         for t in [self.m_d_sum, self.m_step, self.m_inside_sum, self.m_vapp_err_sum, self.m_near_cnt, self.m_vtan_sum, self.m_vtgt_sum, self.m_angvel_sum]:
             t[envs_idx] = 0
+        for k in rew_keys:
+            self.episode_sums[k][envs_idx] = 0.0
 
     def reset(self):
         self.reset_buf[:] = True
