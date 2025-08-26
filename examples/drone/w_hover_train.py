@@ -69,10 +69,11 @@ def get_train_cfg(exp_name, max_iterations):
 def get_cfgs():
     env_cfg = {
         "num_actions": 4,
-        "obs_stacks" : 15,
+        "obs_stacks" : 20,
         # termination
         "termination_if_roll_greater_than": 80,  # degree
         "termination_if_pitch_greater_than": 80,
+        "termination_if_tilt_greater_than": 80,
         "termination_if_close_to_ground": 0.1,
         "termination_if_x_greater_than": 3.0,
         "termination_if_y_greater_than": 3.0,
@@ -148,7 +149,7 @@ def main():
     parser.add_argument("-R", "--resume_ckpt", type=int, default=0)
     args = parser.parse_args()
 
-    gs.init(seed=0, logging_level="warning")
+    gs.init(seed=0, logging_level="warning", performance_mode=True)
 
     log_dir = f"logs/{args.exp_name}"
     env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()

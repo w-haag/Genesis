@@ -28,7 +28,7 @@ def main():
     parser.add_argument("--record", action="store_true", default=False)
     args = parser.parse_args()
 
-    gs.init(seed=1)
+    gs.init(seed=1, performance_mode=True)
 
     log_dir = f"logs/{args.exp_name}"
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(open(f"logs/{args.exp_name}/cfgs.pkl", "rb"))
