@@ -211,7 +211,10 @@ class HoverEnv:
         self.base_quat = torch.zeros((self.num_envs, 4), device=gs.device, dtype=gs.tc_float)
         self.base_lin_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.base_ang_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
-        self.base_euler = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+
+        self.world_z = torch.tensor([0.0, 0.0, 1.0], device=gs.device, dtype=gs.tc_float).expand(self.num_envs, 3)
+        self.rad2deg = 180.0 / math.pi
+        self.base_tilt_deg = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
 
         self.tgt_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.tgt_vel_est = torch.zeros_like(self.tgt_vel)
@@ -400,19 +403,16 @@ class HoverEnv:
 
         self.last_commands_adv = self.commands_adv
 
-        # euler after sanitized quat
-        self.base_euler = quat_to_xyz(
-            transform_quat_by_quat(torch.ones_like(self.base_quat)*self.inv_base_init_quat, self.base_quat),
-            rpy=True, degrees=True,
-        )
-        self.base_euler = torch.nan_to_num(self.base_euler, 0.0, 1e6, -1e6)
+
+        gravity_vector = transform_by_quat(self.world_z, inv_base_quat)
+        torch.nan_to_num_(gravity_vector, 0.0, 1e6, -1e6)
+        self.tilt_deg = torch.acos(gravity_vector[:, 2].clamp(-1.0, 1.0)) * self.rad2deg
 
         # check termination
         below_plane = self.base_pos[:, 2] < (self.commands_adv[:, 2] - self.env_cfg["z_margin"])
         adv_hard_hit = self.adv_collision & (~self._success_mask()) & below_plane
         self.crash_condition = (
-            (torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"])
-            | (torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"])
+            (self.tilt_deg > self.env_cfg["termination_if_tilt_greater_than"])
             | (torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"])
             | (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
             | (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
@@ -583,7 +583,7 @@ class HoverEnv:
     def _success_mask(self):
         near  = self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"]
         slow  = self.rel_vel.norm(dim=1) < self.env_cfg["max_rel_speed_mps"]
-        level = (self.base_euler[:, :2].abs() < self.env_cfg["max_tilt_deg"]).all(dim=1)
+        level = self.tilt_deg < self.env_cfg["max_tilt_deg"]
         angvel  = self.base_ang_vel.norm(dim=1) < self.env_cfg["max_angvel_radps"]
         return near & slow & level & angvel
 
