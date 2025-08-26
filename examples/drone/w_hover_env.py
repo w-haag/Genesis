@@ -22,12 +22,11 @@ class ObsStacker:
         self.ptr = (self.ptr + (~done).long()) % self.K
         self.buf[self.rows, self.ptr] = obs_t
 
-        if done.any():
-            self.ptr[done] = 0
-            obs_t_broadcast = obs_t[done].unsqueeze(1).expand(-1, self.K, -1)
-            self.buf[done] = obs_t_broadcast
-            self.buf[done, :, -1] = 1.0
-            self.buf[done, 0, -1] = 0.0
+        self.ptr[done] = 0
+        obs_t_broadcast = obs_t[done].unsqueeze(1).expand(-1, self.K, -1)
+        self.buf[done] = obs_t_broadcast
+        self.buf[done, :, -1] = 1.0
+        self.buf[done, 0, -1] = 0.0
 
     @torch.no_grad()
     def stacked(self):
@@ -54,12 +53,11 @@ class MultiRateStacker:
         self.ptr = (self.ptr + (~done).long()) % self.M
         self.buf[self.rows, self.ptr] = obs_t
 
-        if done.any():
-            self.ptr[done] = 0
-            obs_t_broadcast = obs_t[done].unsqueeze(1).expand(-1, self.M, -1)
-            self.buf[done] = obs_t_broadcast
-            self.buf[done, :, -1] = 1.0
-            self.buf[done, 0, -1] = 0.0
+        self.ptr[done] = 0
+        obs_t_broadcast = obs_t[done].unsqueeze(1).expand(-1, self.M, -1)
+        self.buf[done] = obs_t_broadcast
+        self.buf[done, :, -1] = 1.0
+        self.buf[done, 0, -1] = 0.0
 
     @torch.no_grad()
     def stacked(self):
