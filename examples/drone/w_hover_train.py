@@ -25,8 +25,8 @@ def get_train_cfg(exp_name, max_iterations):
         "algorithm": {
             "class_name": "PPO",
             "clip_param": 0.2,
-            "desired_kl": 0.005,
-            "entropy_coef": 0.001,
+            "desired_kl": 0.01,
+            "entropy_coef": 0.004,
             "gamma": 0.99,
             "lam": 0.95,
             "learning_rate": 0.0003,
@@ -42,7 +42,7 @@ def get_train_cfg(exp_name, max_iterations):
             "activation": "tanh",
             "actor_hidden_dims": [256, 256],
             "critic_hidden_dims": [256, 256],
-            "init_noise_std": 0.1,
+            "init_noise_std": 0.2,
             "class_name": "ActorCritic",
         },
         "runner": {
