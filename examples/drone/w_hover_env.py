@@ -211,8 +211,9 @@ class HoverEnv:
         self.base_ang_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
 
         self.world_z = torch.tensor([0.0, 0.0, 1.0], device=gs.device, dtype=gs.tc_float).expand(self.num_envs, 3)
-        self.rad2deg = 180.0 / math.pi
-        self.base_tilt_deg = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.max_tilt_cos  = math.cos(math.radians(self.env_cfg["max_tilt_deg"]))
+        self.term_tilt_cos = math.cos(math.radians(self.env_cfg["termination_if_tilt_greater_than"]))
+        self.base_tilt_cos = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
 
         self.tgt_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.tgt_vel_est = torch.zeros_like(self.tgt_vel)
@@ -294,7 +295,6 @@ class HoverEnv:
             self._resample_adv(todo_idx)
 
             self.rel_pos[todo_idx] = self.commands_adv[todo_idx] - self.base_pos[todo_idx]
-            self.rel_pos[todo_idx].nan_to_num_(0.0, 1e6, -1e6) 
 
             clearance_mask = self.rel_pos[todo_idx, :2].norm(dim=1) >= spawn_clearance
             temp_todo = todo.clone() # for pytorch reasons...
@@ -323,6 +323,7 @@ class HoverEnv:
         self.drone.set_propellels_rpm((1 + exec_actions * 0.8) * 14468.429183500699) #yes, that's the correct API function name
         # update target pos
         self.adv_sinus = self.adv_a * torch.sin(math.tau*self.adv_f*self.episode_length_buf.unsqueeze(-1)*self.dt + self.adv_phi)
+        self.last_commands_adv = self.commands_adv
         self.commands_adv = self.commands + self.adv_sinus
 
         meas_tgt_vel = (self.commands_adv - self.last_commands_adv) / self.dt
@@ -337,14 +338,7 @@ class HoverEnv:
             self.adversary.set_pos(self.commands_adv + self.adv_base_offset, zero_velocity=True)
             adv_contact = self.adversary.get_contacts(with_entity=self.drone, exclude_self_contact=True)
             self.adv_collision = (adv_contact['penetration'] > 0).any(dim=1)
-        # per-env highlight
-        if self.target_threshold_highlight is not None:
-            near = (self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"])
-            # per-env positions: show at target when near, park far below otherwise
-            threshold_pos = torch.where(near.unsqueeze(1), self.commands_adv, self.highlight_hide)
-            reached_pos = torch.where(self._success_mask().unsqueeze(1), self.commands_adv, self.highlight_hide)
-            self.target_threshold_highlight.set_pos(threshold_pos, zero_velocity=True)
-            self.target_reached_highlight.set_pos(reached_pos, zero_velocity=True)
+
         self.scene.step()
 
         # update buffers
@@ -389,6 +383,7 @@ class HoverEnv:
         self.m_d_sum += d
         self.m_step  += 1
         self.m_inside_sum += (d < self.env_cfg["at_target_threshold"]).float()
+        self.m_vtgt_sum += self.tgt_vel.norm(dim=1)
 
         mask = d < sigma
         self.m_near_cnt += mask.float()
@@ -396,21 +391,25 @@ class HoverEnv:
         self.m_vtan_sum += torch.where(mask, v_tan.norm(dim=1), 0.0)
         self.m_angvel_sum += torch.where(mask, w_norm, 0.0)
 
-        self.m_vtgt_sum += self.tgt_vel.norm(dim=1)
+        # calculate tilt using gravity vector
+        self.base_tilt_cos = transform_by_quat(self.world_z, inv_base_quat)[:, 2].clamp(-1.0, 1.0)
 
+        success_mask = self._success_mask()
 
-        self.last_commands_adv = self.commands_adv
-
-
-        gravity_vector = transform_by_quat(self.world_z, inv_base_quat)
-        torch.nan_to_num_(gravity_vector, 0.0, 1e6, -1e6)
-        self.base_tilt_deg = torch.acos(gravity_vector[:, 2].clamp(-1.0, 1.0)) * self.rad2deg
+        # target visualisation
+        if self.target_threshold_highlight is not None:
+            near = (self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"])
+            # per-env positions: show at target when near, park far below otherwise
+            threshold_pos = torch.where(near.unsqueeze(1), self.commands_adv, self.highlight_hide)
+            reached_pos = torch.where(success_mask.unsqueeze(1), self.commands_adv, self.highlight_hide)
+            self.target_threshold_highlight.set_pos(threshold_pos, zero_velocity=True)
+            self.target_reached_highlight.set_pos(reached_pos, zero_velocity=True)
 
         # check termination
         below_plane = self.base_pos[:, 2] < (self.commands_adv[:, 2] - self.env_cfg["z_margin"])
-        adv_hard_hit = self.adv_collision & (~self._success_mask()) & below_plane
+        adv_hard_hit = self.adv_collision & (~success_mask) & below_plane
         self.crash_condition = (
-            (self.base_tilt_deg > self.env_cfg["termination_if_tilt_greater_than"])
+            (self.base_tilt_cos < self.term_tilt_cos)
             | (torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"])
             | (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
             | (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
@@ -420,7 +419,7 @@ class HoverEnv:
         )
 
         # check success
-        self.stable_cnt = torch.where(self._success_mask(), (self.stable_cnt + 1).clamp_max(self.n_stable), torch.zeros_like(self.stable_cnt))
+        self.stable_cnt = torch.where(success_mask, (self.stable_cnt + 1).clamp_max(self.n_stable), torch.zeros_like(self.stable_cnt))
         self.success = self.stable_cnt >= self.n_stable
 
         # update curriculum
@@ -591,7 +590,6 @@ class HoverEnv:
         self.reset_buf[:] = True
         self.reset_idx(torch.arange(self.num_envs, device=gs.device))
         obs_t = self.build_obs()
-        self.stacker.buf.zero_(); self.stacker.ptr.zero_()
         self.stacker.push(obs_t, torch.ones(self.num_envs, dtype=torch.bool, device=gs.device))
         self.obs_buf = self.stacker.stacked()
         return self.obs_buf, None
@@ -599,7 +597,7 @@ class HoverEnv:
     def _success_mask(self):
         near  = self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"]
         slow  = self.rel_vel.norm(dim=1) < self.env_cfg["max_rel_speed_mps"]
-        level = self.base_tilt_deg < self.env_cfg["max_tilt_deg"]
+        level = self.base_tilt_cos > self.max_tilt_cos
         angvel  = self.base_ang_vel.norm(dim=1) < self.env_cfg["max_angvel_radps"]
         return near & slow & level & angvel
 
