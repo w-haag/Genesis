@@ -285,8 +285,11 @@ class HoverEnv:
         spawn_clearance = 0.2 #TODO param
         todo = torch.ones(len(envs_idx), dtype=torch.bool, device=gs.device)
 
-        while todo.any():
+        MAX_TRIES = 4
+        for _ in range(MAX_TRIES):
             todo_idx = envs_idx[todo]
+            if todo_idx.numel() == 0:
+                break
 
             self.commands[todo_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(todo_idx),), gs.device)
             self.commands[todo_idx, 1] = gs_rand_float(*self.command_cfg["pos_y_range"], (len(todo_idx),), gs.device)
@@ -343,29 +346,30 @@ class HoverEnv:
 
         # update buffers
         self.episode_length_buf += 1
-        self.last_base_pos[:] = self.base_pos[:]
+        self.last_base_pos.copy_(self.base_pos)
 
         # sanitize raw sim outputs
-        self.base_pos[:] = self.drone.get_pos()
-        self.base_quat[:] = self.drone.get_quat()
-        self.base_pos.nan_to_num_(0.0, 1e6, -1e6)
-        self.base_quat.nan_to_num_(0.0, 1e6, -1e6)
-        self.base_quat /= self.base_quat.norm(dim=1, keepdim=True).clamp_min(1e-6)
-        inv_base_quat = inv_quat(self.base_quat)
+        pos  = self.drone.get_pos()
+        quat = self.drone.get_quat()
+        lin  = self.drone.get_vel()
+        ang  = self.drone.get_ang()
+        pos.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+        quat.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+        lin.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
+        ang.nan_to_num_(nan=0.0, posinf=1e6, neginf=-1e6)
 
-        # body-frame velocities
-        self.base_lin_vel[:] = transform_by_quat(self.drone.get_vel(), inv_base_quat)
-        self.base_ang_vel[:] = transform_by_quat(self.drone.get_ang(), inv_base_quat)
-        self.base_lin_vel.nan_to_num_(0.0, 1e6, -1e6)
-        self.base_ang_vel.nan_to_num_(0.0, 1e6, -1e6)
+        quat = quat / quat.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        inv_base_quat = inv_quat(quat)
+
+        self.base_pos.copy_(pos)
+        self.base_quat.copy_(quat)
+        self.base_lin_vel.copy_(transform_by_quat(lin, inv_base_quat))
+        self.base_ang_vel.copy_(transform_by_quat(ang, inv_base_quat))
 
         # relatives
-        self.last_rel_pos[:] = self.rel_pos[:]
-        self.rel_pos[:] = self.commands_adv[:] - self.base_pos[:]
-        self.rel_vel[:] = (self.rel_pos[:] - self.last_rel_pos[:]) / self.dt
-        self.rel_pos.nan_to_num_(0.0, 1e6, -1e6)
-        self.last_rel_pos.nan_to_num_(0.0, 1e6, -1e6)
-        self.rel_vel.nan_to_num_(0.0, 1e6, -1e6)
+        self.last_rel_pos.copy_(self.rel_pos)
+        self.rel_pos.copy_(self.commands_adv - self.base_pos)
+        self.rel_vel.copy_((self.rel_pos - self.last_rel_pos) / self.dt)
 
         # approach
         d_now, _, vc_now, _ = self.app_geom
