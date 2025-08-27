@@ -19,7 +19,8 @@ class ObsStacker:
             
     @torch.no_grad()
     def push(self, obs_t, done):  # done: bool [N]
-        self.ptr = (self.ptr + (~done).long()) % self.K
+        inc = (~done).to(self.ptr.dtype)
+        self.ptr.add_(inc).remainder_(self.K)
         self.buf[self.rows, self.ptr] = obs_t
 
         self.ptr[done] = 0
@@ -34,11 +35,6 @@ class ObsStacker:
         out = self.buf.gather(1, idx[..., None].expand(-1, -1, self.D))  # [N,K,D]
         return out.reshape(self.N, self.K * self.D)  # [N, K·D]
 
-    @torch.no_grad()
-    def retarget(self, envs_idx):
-        self.buf[envs_idx, :, :18] = 0.0 # 18 = up to base quat
-        self.buf[envs_idx, :, -1] = 1.0
-
 class MultiRateStacker:
     def __init__(self, num_envs, obs_dim, K, device, group=3, max_horizon=None):
         self.N, self.D, self.K, self.device = num_envs, obs_dim, K, device
@@ -50,7 +46,8 @@ class MultiRateStacker:
             
     @torch.no_grad()
     def push(self, obs_t, done):
-        self.ptr = (self.ptr + (~done).long()) % self.M
+        inc = (~done).to(self.ptr.dtype)
+        self.ptr.add_(inc).remainder_(self.M)
         self.buf[self.rows, self.ptr] = obs_t
 
         self.ptr[done] = 0
@@ -64,11 +61,6 @@ class MultiRateStacker:
         idx = (self.ptr[:, None] - self.offsets[None, :]) % self.M
         out = self.buf.gather(1, idx[..., None].expand(-1, -1, self.D))
         return out.reshape(self.N, self.K * self.D)
-
-    @torch.no_grad()
-    def retarget(self, envs_idx):
-        self.buf[envs_idx, :, :18] = 0.0 # 18 = up to base quat
-        self.buf[envs_idx, :, -1] = 1.0
 
     @staticmethod
     def _build_offsets(K, group, max_horizon):
@@ -455,8 +447,10 @@ class HoverEnv:
         obs_t = self.build_obs()
         obs_t = torch.nan_to_num(obs_t, nan=0.0, posinf=1e6, neginf=-1e6)
         obs_t = torch.clamp(obs_t, -100.0, 100.0)
+
+        # push obs to stacker, clear stack for reset and resampled envs
         done = self.reset_buf.bool()
-        self.stacker.retarget(envs_idx)
+        done[envs_idx] = True
         self.stacker.push(obs_t, done)        
         self.obs_buf = self.stacker.stacked()
 
