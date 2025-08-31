@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./run_ckpts.sh BASE_FILENAME MAX_CKPT [STEPS=8]
-[ $# -ge 2 ] || { echo "Usage: $0 BASE_FILENAME MAX_CKPT [STEPS=8]"; exit 1; }
+# Usage: ./run_ckpts.sh BASE_FILENAME MIN_CKPT MAX_CKPT [STEPS=8]
+[ $# -ge 2 ] || { echo "Usage: $0 BASE_FILENAME MIN_CKPT MAX_CKPT [STEPS=8]"; exit 1; }
 
 BASE="$1"
-MAX="$2"
-STEPS="${3:-8}"
+MIN="$2"
+MAX="$3"
+STEPS="${4:-8}"
 
 export PYOPENGL_PLATFORM=glx  # don't rely on your alias
 # If your launcher isn't "vk_pro python", override with: GLX_CMD="mycmd" ./run_ckpts.sh ...
 GLX_CMD=${GLX_CMD:-vk_pro python}
 
-CKPTS=$(python3 - "$MAX" "$STEPS" <<'PY'
+CKPTS=$(python3 - "$MIN" "$MAX" "$STEPS" <<'PY'
 import sys, math
-minv = 100
-maxv = int(sys.argv[1])
-steps = int(sys.argv[2])
+minv = int(sys.argv[1])
+maxv = int(sys.argv[2])
+steps = int(sys.argv[3])
 
 if steps < 2:
     out = [maxv]
