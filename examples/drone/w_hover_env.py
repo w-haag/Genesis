@@ -403,15 +403,23 @@ class HoverEnv:
         # check termination
         below_plane = self.base_pos[:, 2] < (self.commands_adv[:, 2] - self.env_cfg["z_margin"])
         adv_hard_hit = self.adv_collision & (~success_mask) & below_plane
-        self.crash_condition = (
-            (self.base_tilt_cos < self.term_tilt_cos)
-            | (torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"])
-            | (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
-            | (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
-            | (torch.abs(self.base_ang_vel[:, 2]) > self.env_cfg["termination_if_angvel_greater_than"])
-            | (self.base_pos[:, 2] < self.env_cfg["termination_if_close_to_ground"])
-            | adv_hard_hit
-        )
+        tilt_term = (self.base_tilt_cos < self.term_tilt_cos)
+        x_term = (torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"])
+        y_term = (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
+        z_term = (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
+        yaw_term = (torch.abs(self.base_ang_vel[:, 2]) > self.env_cfg["termination_if_angvel_greater_than"]) # TODO use norm instead of just yaw?
+        floor_term = (self.base_pos[:, 2] < self.env_cfg["termination_if_close_to_ground"])
+
+        self.extras["term_causes_now"] = {
+            "term_tilt": tilt_term.float(),
+            "term_x": x_term.float(),
+            "term_y": y_term.float(),
+            "term_z": z_term.float(),
+            "term_yaw": yaw_term.float(),
+            "term_floor": floor_term.float(),
+            "term_adv_hit": adv_hard_hit.float()
+        }
+        self.crash_condition = (tilt_term | x_term | y_term | z_term | yaw_term | floor_term | adv_hard_hit)
 
         # check success
         self.stable_cnt = torch.where(success_mask, (self.stable_cnt + 1).clamp_max(self.n_stable), torch.zeros_like(self.stable_cnt))
@@ -436,6 +444,12 @@ class HoverEnv:
         time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).flatten()
         self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=gs.device, dtype=gs.tc_float)
         self.extras["time_outs"][time_out_idx] = 1.0
+
+        reset_idx_now = self.reset_buf.nonzero(as_tuple=False).flatten()
+        self.extras["term_timeout"] = torch.zeros_like(self.reset_buf, device=gs.device, dtype=gs.tc_float)
+        self.extras["term_timeout"][ (self.episode_length_buf > self.max_episode_length) ] = 1.0
+        self.extras["term_reset_idx_now"] = reset_idx_now  # for logging in reset_idx
+
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
 
         # resample successful envs
@@ -575,6 +589,13 @@ class HoverEnv:
         ep["metric_difficulty"]      = diff
         for k, v in zip(rew_keys, rew_cpu):
             ep[f"rew_{k}"] = v
+
+        # Termination histogram for just-reset envs
+        ri = self.extras.get("term_reset_idx_now", None)
+        if ri is not None and len(ri) > 0:
+            for k, v in self.extras.get("term_causes_now", {}).items():
+                ep[k] = v[ri].mean().item()
+            ep["term_timeout"] = self.extras["term_timeout"][ri].mean().item()
 
 
         # clear for next episodes
