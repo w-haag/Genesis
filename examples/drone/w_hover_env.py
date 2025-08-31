@@ -327,8 +327,6 @@ class HoverEnv:
         self.tgt_acc_est = 0.9 * self.tgt_acc_est + 0.1 * meas_tgt_acc
         self.tgt_vel = self.tgt_vel_est
 
-        if self.target is not None:
-            self.target.set_pos(self.commands_adv, zero_velocity=True)
         if self.adversary is not None:
             self.adversary.set_pos(self.commands_adv + self.adv_base_offset, zero_velocity=True)
             adv_contact = self.adversary.get_contacts(with_entity=self.drone, exclude_self_contact=True)
@@ -393,11 +391,12 @@ class HoverEnv:
         success_mask = self._success_mask()
 
         # target visualisation
-        if self.target_threshold_highlight is not None:
+        if self.target is not None:
             near = (self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"])
             # per-env positions: show at target when near, park far below otherwise
             threshold_pos = torch.where(near.unsqueeze(1), self.commands_adv, self.highlight_hide)
             reached_pos = torch.where(success_mask.unsqueeze(1), self.commands_adv, self.highlight_hide)
+            self.target.set_pos(self.commands_adv, zero_velocity=True)
             self.target_threshold_highlight.set_pos(threshold_pos, zero_velocity=True)
             self.target_reached_highlight.set_pos(reached_pos, zero_velocity=True)
 
