@@ -43,8 +43,8 @@ def main():
 
     # Eval-only safety and visuals.
     env_cfg["episode_length_s"] = 20.0
-    env_cfg["adv_max_v"] = 1.0
-    env_cfg["adv_min_v"] = 1.0
+    env_cfg["adv_max_v"] = 0.5
+    env_cfg["adv_min_v"] = 0.5
     env_cfg["termination_if_tilt_greater_than"] = 170.0
     env_cfg["termination_if_angvel_greater_than"] = 100.0
     env_cfg["visualize_target"] = True

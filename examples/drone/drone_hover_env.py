@@ -413,7 +413,7 @@ class HoverEnv:
         self._resample_commands(envs_idx)
 
         # adversary pose: near its target but not exactly on it
-        jitter_xy = 0.1
+        jitter_xy = 0.3
         xy = torch.randn((len(envs_idx), 2), device=gs.device, dtype=gs.tc_float) * jitter_xy
         adv_base = torch.zeros((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float)
         adv_base[:, :2] = self.commands[envs_idx, :2] + xy
