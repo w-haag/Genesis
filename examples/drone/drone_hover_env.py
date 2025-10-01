@@ -2,7 +2,7 @@ import torch
 import math
 import copy
 import genesis as gs
-from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat
+from genesis.utils.geom import transform_by_quat, inv_quat
 from torch.nn import functional
 
 
@@ -35,6 +35,47 @@ class ObsStacker:
         out = self.buf.gather(1, idx[..., None].expand(-1, -1, self.D))
         return out.reshape(self.N, self.K * self.D)
 
+class MultiRateStacker:
+    def __init__(self, num_envs, obs_dim, K, device, group=3, max_horizon=None):
+        self.N, self.D, self.K, self.device = num_envs, obs_dim, K, device
+        self.rows = torch.arange(self.N, dtype=torch.long, device=device)
+        self.offsets = torch.tensor(self._build_offsets(K, group, max_horizon), dtype=torch.long, device=device)
+        self.M = int(self.offsets[-1].item()) + 1
+        self.buf = torch.zeros(num_envs, self.M, obs_dim, dtype=gs.tc_float, device=device)
+        self.ptr = torch.zeros(num_envs, dtype=torch.long, device=device)
+            
+    @torch.no_grad()
+    def push(self, obs_t, done):
+        inc = (~done).to(self.ptr.dtype)
+        self.ptr.add_(inc).remainder_(self.M)
+        self.buf[self.rows, self.ptr] = obs_t
+
+        self.ptr[done] = 0
+        obs_t_broadcast = obs_t[done].unsqueeze(1).expand(-1, self.M, -1)
+        self.buf[done] = obs_t_broadcast
+        self.buf[done, :, -1] = 1.0
+        self.buf[done, 0, -1] = 0.0
+
+    @torch.no_grad()
+    def stacked(self):
+        idx = (self.ptr[:, None] - self.offsets[None, :]) % self.M
+        out = self.buf.gather(1, idx[..., None].expand(-1, -1, self.D))
+        return out.reshape(self.N, self.K * self.D)
+
+    @staticmethod
+    def _build_offsets(K, group, max_horizon):
+        offs, stride, used = [0], 1, 0
+        cap = None if max_horizon is None else int(max_horizon)
+        for _ in range(1, K):
+            nxt = offs[-1] + stride
+            if cap is not None and nxt > cap:
+                nxt = cap
+            offs.append(nxt)
+            used += 1
+            if used == group:
+                stride <<= 1
+                used = 0
+        return offs
 
 class HoverEnv:
     """
@@ -100,11 +141,16 @@ class HoverEnv:
                 morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.052, fixed=False, collision=False),
                 surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.0, 1.0, 0.0))),
             )
+            self.adv_target_marker = self.scene.add_entity(
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.04, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.2, 0.4, 1.0))),
+            )
             self.highlight_hide = torch.tensor([0.0, 0.0, -1.0], device=gs.device, dtype=gs.tc_float)
         else:
             self.target = None
             self.target_threshold_highlight = None
             self.target_reached_highlight = None
+            self.adv_target_marker = None
 
         # adversary control mode
         self.adv_control = str(self.env_cfg.get("adversary_control", "policy")).lower()
@@ -142,8 +188,9 @@ class HoverEnv:
         self.reset_buf = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.episode_length_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
 
-        self.commands = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)  # original target
-        self.commands_adv = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)  # ego tracks this = adversary top
+        # commands: adversary's moving setpoint; commands_adv: ego's target (adversary top)
+        self.commands = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)
+        self.commands_adv = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)
         self.last_commands_adv = torch.zeros_like(self.commands_adv)
 
         self.actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
@@ -178,7 +225,7 @@ class HoverEnv:
         self.term_tilt_cos = math.cos(math.radians(self.env_cfg["termination_if_tilt_greater_than"]))
         self.base_tilt_cos = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
 
-        # target kinematics for ego (now the adversary top)
+        # target kinematics for ego (adversary top)
         self.tgt_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.tgt_vel_est = torch.zeros_like(self.tgt_vel)
         self.tgt_acc_est = torch.zeros_like(self.tgt_vel)
@@ -198,7 +245,7 @@ class HoverEnv:
         self.prev_ang_norm = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
         self.prev_yaw_abs = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
-        # adversary observation stacker (same D,K as ego)
+        # obs stackers
         D = self.build_obs_template_dim()
         K = self.env_cfg["obs_stacks"]
         self.stacker = ObsStacker(self.num_envs, D, K, gs.device)
@@ -226,7 +273,13 @@ class HoverEnv:
         self.success = torch.zeros(self.num_envs, dtype=torch.bool, device=gs.device)
 
         self.extras = {"observations": {}}
-        self.adv_policy = None  # set via set_adversary_policy()
+        self.adv_policy = None
+
+        # moving path for adversary setpoint
+        self.commands_anchor = torch.zeros_like(self.commands)
+        self.path_a = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.path_f = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.path_phi = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
 
     # ---------- public API ----------
     def set_adversary_policy(self, policy_callable):
@@ -279,6 +332,25 @@ class HoverEnv:
         return torch.exp(- (dist / decay) ** 2)
 
     # ---------- resets and sampling ----------
+    def _resample_adv_path(self, envs_idx):
+        v_max = float(self.env_cfg.get("adv_max_v", 1.0))
+        v_min = float(self.env_cfg.get("adv_min_v", 0.5))
+        f_max = float(self.env_cfg.get("adv_max_f", 0.6))
+        f = torch.rand((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float) * f_max
+        f.clamp_min_(0.1)
+        v = torch.rand_like(f) * v_max
+        v.clamp_min_(v_min)
+        a = v / (math.tau * f * math.sqrt(3))
+        # keep Z excursions above ground margin
+        a[:, 2] = torch.minimum(
+            a[:, 2],
+            (self.commands_anchor[envs_idx, 2] - self.z_margin).clamp_min(0.0),
+        )
+        phi = torch.rand_like(f) * math.tau
+        self.path_a[envs_idx] = a
+        self.path_f[envs_idx] = f
+        self.path_phi[envs_idx] = phi
+
     def _resample_commands(self, envs_idx):
         spawn_clearance = 0.2
         todo = torch.ones(len(envs_idx), dtype=torch.bool, device=gs.device)
@@ -296,6 +368,10 @@ class HoverEnv:
             ok = rel[:, :2].norm(dim=1) >= spawn_clearance
             temp = todo.clone()
             todo[temp] = ~ok
+
+        # path anchor and new sinusoid
+        self.commands_anchor[envs_idx] = self.commands[envs_idx]
+        self._resample_adv_path(envs_idx)
 
         # reset rel terms for ego
         self.rel_pos[envs_idx] = 0.0
@@ -341,7 +417,7 @@ class HoverEnv:
         xy = torch.randn((len(envs_idx), 2), device=gs.device, dtype=gs.tc_float) * jitter_xy
         adv_base = torch.zeros((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float)
         adv_base[:, :2] = self.commands[envs_idx, :2] + xy
-        adv_base[:, 2] = (self.commands[envs_idx, 2] + self.adv_base_offset[2])  # <-- fixed
+        adv_base[:, 2] = (self.commands[envs_idx, 2] + self.adv_base_offset[2])
         self.adv_pos[envs_idx] = adv_base
         self.adv_last_pos[envs_idx] = adv_base
         self.adv_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
@@ -446,7 +522,7 @@ class HoverEnv:
         return self._concat_obs(
             rel_pos=adv_rel,
             rel_vel=adv_rel_vel,
-            tgt_vel=torch.zeros_like(adv_rel),       # static target
+            tgt_vel=torch.zeros_like(adv_rel),
             tgt_acc=torch.zeros_like(adv_rel),
             dist=torch.clip(d * self.obs_scales.get("dist", 1.0), 0.0, 2.0),
             vel_close=torch.clip(vel_close * self.obs_scales.get("vel_close", 1.0), -2.0, 2.0),
@@ -468,6 +544,11 @@ class HoverEnv:
 
     # ---------- step ----------
     def step(self, actions):
+        # update adversary setpoint path first
+        t = self.episode_length_buf.unsqueeze(-1).to(self.path_f.dtype) * self.dt  # [N,1]
+        path = self.path_a * torch.sin(math.tau * self.path_f * t + self.path_phi)
+        self.commands = self.commands_anchor + path
+
         # ego actions
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         ego_exec = self.actions
@@ -577,7 +658,7 @@ class HoverEnv:
         self.stable_cnt = torch.where(success_mask, (self.stable_cnt + 1).clamp_max(self.n_stable), torch.zeros_like(self.stable_cnt))
         self.success = self.stable_cnt >= self.n_stable
 
-        # target visualize = adversary top
+        # visualize targets: red = ego target (adv top), blue = adversary setpoint
         if self.target is not None:
             near = (self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"])
             threshold_pos = torch.where(near.unsqueeze(1), self.commands_adv, self.highlight_hide)
@@ -585,6 +666,8 @@ class HoverEnv:
             self.target.set_pos(self.commands_adv, zero_velocity=True)
             self.target_threshold_highlight.set_pos(threshold_pos, zero_velocity=True)
             self.target_reached_highlight.set_pos(reached_pos, zero_velocity=True)
+            if self.adv_target_marker is not None:
+                self.adv_target_marker.set_pos(self.commands, zero_velocity=True)
 
         # rewards
         self.rew_buf[:] = 0.0
