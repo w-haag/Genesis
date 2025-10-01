@@ -18,7 +18,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
 
-from w_hover_env import HoverEnv
+from dog_hover_env import HoverEnv
 
 
 def main():

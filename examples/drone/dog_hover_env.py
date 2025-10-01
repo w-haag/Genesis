@@ -159,11 +159,17 @@ class HoverEnv:
             self.adversary_dog = self.scene.add_entity(gs.morphs.URDF(file="urdf/go2/urdf/go2.urdf", fixed=True, collision=False))
             self.adversary = self.scene.add_entity(
                 morph=gs.morphs.Box(size=(0.25, 0.25, self.env_cfg["adv_box_h"]), fixed=False, collision=True),
-                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.0, 0.0)))
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.62, 0.64, 0.66)))
+            )
+            # add a thin inlaid pad for visual cue (no collision) ---
+            self.adversary_pad = self.scene.add_entity(
+                morph=gs.morphs.Box(size=(0.22, 0.22, 0.01), fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.90, 0.92, 0.94)))
             )
         else:
             self.adversary_dog = None
             self.adversary = None
+            self.adversary_pad = None
 
         # add camera
         if self.env_cfg["visualize_camera"]:
@@ -240,8 +246,7 @@ class HoverEnv:
 
         D = self.build_obs().shape[-1]
         K = self.env_cfg["obs_stacks"]
-        self.stacker = ObsStacker(self.num_envs, D, K, gs.device)
-        # self.stacker = MultiRateStacker(self.num_envs, D, K, gs.device, group=5)
+        self.stacker = MultiRateStacker(self.num_envs, D, K, gs.device, group=5)
         self.num_obs = D * K
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=gs.device, dtype=gs.tc_float)
 
@@ -249,12 +254,15 @@ class HoverEnv:
         self.adv_f = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.adv_phi = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.adv_sinus = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+
         z_off = -(self.env_cfg["z_margin"] + 0.5*self.env_cfg["adv_box_h"])
         dog_off = -(self.env_cfg["z_margin"] + self.env_cfg["adv_box_h"] + 0.08)
+        pad_off = z_off + 0.01
         self.adv_base_offset = torch.tensor([0.0, 0.0, z_off], device=gs.device, dtype=gs.tc_float)
         self.adv_dog_offset = torch.tensor([0.05, 0.0, dog_off], device=gs.device, dtype=gs.tc_float)
-        self.adv_collision = torch.zeros((self.num_envs,), device=gs.device, dtype=torch.bool)
+        self.adv_pad_offset = torch.tensor([0.0, 0.0, pad_off], device=gs.device, dtype=gs.tc_float)
 
+        self.adv_collision = torch.zeros((self.num_envs,), device=gs.device, dtype=torch.bool)
         self.crash_condition = torch.zeros(self.num_envs, dtype=torch.bool, device=gs.device)
 
         # metric accumulators
@@ -376,6 +384,7 @@ class HoverEnv:
                 dofs_idx_local=self.dog_all_local_idx,
                 zero_velocity=True,
             )
+            self.adversary_pad.set_pos(self.commands_adv + self.adv_pad_offset, zero_velocity=True)
             adv_contact = self.adversary.get_contacts(with_entity=self.drone, exclude_self_contact=True)
             self.adv_collision = (adv_contact['penetration'] > 0).any(dim=1)
 
