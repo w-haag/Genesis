@@ -73,7 +73,7 @@ def main():
         ]
 
     reward_cfg["reward_scales"] = {}
-    command_cfg["pos_z_range"] = [0.51, 0.51]
+    command_cfg["pos_z_range"] = [0.47, 0.47]
 
     # visualize the target
     env_cfg["visualize_target"] = True
