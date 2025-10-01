@@ -42,9 +42,9 @@ def main():
     env_cfg["z_margin"] = 0.00
 
     # Eval-only safety and visuals.
-    env_cfg["episode_length_s"] = 60.0
-    env_cfg["adv_difficulty_max"] = 1.0
-    env_cfg["adv_difficulty_min"] = 1.0
+    env_cfg["episode_length_s"] = 20.0
+    env_cfg["adv_max_v"] = 1.0
+    env_cfg["adv_min_v"] = 1.0
     env_cfg["termination_if_tilt_greater_than"] = 170.0
     env_cfg["termination_if_angvel_greater_than"] = 100.0
     env_cfg["visualize_target"] = True
