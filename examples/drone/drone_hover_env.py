@@ -1,0 +1,676 @@
+import torch
+import math
+import copy
+import genesis as gs
+from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat
+from torch.nn import functional
+
+
+def gs_rand_float(lower, upper, shape, device):
+    return (upper - lower) * torch.rand(size=shape, device=device, dtype=gs.tc_float) + lower
+
+
+class ObsStacker:
+    def __init__(self, num_envs, obs_dim, K, device):
+        self.N, self.D, self.K, self.device = num_envs, obs_dim, K, device
+        self.rows = torch.arange(self.N, dtype=torch.long, device=device)
+        self.offsets = torch.arange(self.K, dtype=torch.long, device=self.device)
+        self.buf = torch.zeros(num_envs, K, obs_dim, dtype=gs.tc_float, device=device)
+        self.ptr = torch.zeros(num_envs, dtype=torch.long, device=device)
+
+    @torch.no_grad()
+    def push(self, obs_t, done):
+        inc = (~done).to(self.ptr.dtype)
+        self.ptr.add_(inc).remainder_(self.K)
+        self.buf[self.rows, self.ptr] = obs_t
+        self.ptr[done] = 0
+        obs_t_b = obs_t[done].unsqueeze(1).expand(-1, self.K, -1)
+        self.buf[done] = obs_t_b
+        self.buf[done, :, -1] = 1.0
+        self.buf[done, 0, -1] = 0.0
+
+    @torch.no_grad()
+    def stacked(self):
+        idx = (self.ptr[:, None] - self.offsets[None, :]) % self.K
+        out = self.buf.gather(1, idx[..., None].expand(-1, -1, self.D))
+        return out.reshape(self.N, self.K * self.D)
+
+
+class HoverEnv:
+    """
+    Two-drone chase:
+      • Adversary is a real drone, not kinematic.
+      • Adversary policy tracks the original target point `commands` (its *top* goes there).
+      • Ego policy tracks the adversary’s *top* point (collision allowed).
+      • Ego resets on its own terminations; adversary reaching target never triggers reset.
+
+    API is unchanged for training/inference of the ego: step(actions) -> obs, rew, done, info.
+    Provide the adversary policy via set_adversary_policy().
+    """
+    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
+        self.num_envs = num_envs
+        self.rendered_env_num = min(10, self.num_envs)
+        self.num_actions = env_cfg["num_actions"]
+        self.num_commands = command_cfg["num_commands"]
+        self.device = gs.device
+
+        self.simulate_action_latency = env_cfg.get("simulate_action_latency", False)
+        self.dt = 0.01
+        self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
+
+        self.env_cfg = env_cfg
+        self.obs_cfg = obs_cfg
+        self.reward_cfg = reward_cfg
+        self.command_cfg = command_cfg
+
+        self.obs_scales = obs_cfg["obs_scales"]
+        self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
+
+        # sim + viewer
+        self.scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
+            viewer_options=gs.options.ViewerOptions(
+                max_FPS=env_cfg["max_visualize_FPS"],
+                camera_pos=(3.0, 0.0, 3.0),
+                camera_lookat=(0.0, 0.0, 1.0),
+                camera_fov=40,
+            ),
+            vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(self.rendered_env_num))),
+            rigid_options=gs.options.RigidOptions(
+                dt=self.dt,
+                constraint_solver=gs.constraint_solver.Newton,
+                enable_collision=True,
+                enable_joint_limit=True,
+            ),
+            show_viewer=show_viewer,
+        )
+        self.scene.add_entity(gs.morphs.Plane())
+
+        # visual aids
+        if self.env_cfg.get("visualize_target", False):
+            self.target = self.scene.add_entity(
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.05, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.5, 0.5))),
+            )
+            self.target_threshold_highlight = self.scene.add_entity(
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.051, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.5, 0.75, 0.5))),
+            )
+            self.target_reached_highlight = self.scene.add_entity(
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.052, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.0, 1.0, 0.0))),
+            )
+            self.highlight_hide = torch.tensor([0.0, 0.0, -1.0], device=gs.device, dtype=gs.tc_float)
+        else:
+            self.target = None
+            self.target_threshold_highlight = None
+            self.target_reached_highlight = None
+
+        # adversary control mode
+        self.adv_control = str(self.env_cfg.get("adversary_control", "policy")).lower()
+
+        # drones
+        self.drone = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf"))
+        # adversary is always a drone here
+        self.adversary = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf"))
+
+        # optional camera
+        if self.env_cfg.get("visualize_camera", False):
+            self.cam = self.scene.add_camera(
+                res=(960, 540), pos=(3.5, 0.0, 2.5), lookat=(0, 0, 0.5), fov=30, GUI=True
+            )
+
+        # constants
+        self.base_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)
+        self.base_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)
+        self.inv_base_init_quat = inv_quat(self.base_init_quat)
+
+        # build
+        self.scene.build(n_envs=num_envs)
+
+        # reward setup (dt-scale non-event terms)
+        self.reward_functions, self.episode_sums = dict(), dict()
+        EVENT = {"success", "crash"}
+        for name in copy.deepcopy(self.reward_cfg["reward_scales"]).keys():
+            if name not in EVENT:
+                self.reward_scales[name] *= self.dt
+            self.reward_functions[name] = getattr(self, "_reward_" + name)
+            self.episode_sums[name] = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+
+        # buffers: ego
+        self.rew_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+        self.reset_buf = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_int)
+        self.episode_length_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
+
+        self.commands = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)  # original target
+        self.commands_adv = torch.zeros((self.num_envs, self.num_commands), device=gs.device, dtype=gs.tc_float)  # ego tracks this = adversary top
+        self.last_commands_adv = torch.zeros_like(self.commands_adv)
+
+        self.actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
+        self.last_actions = torch.zeros_like(self.actions)
+
+        self.rel_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.last_rel_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.rel_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+
+        self.base_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.last_base_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.base_quat = torch.zeros((self.num_envs, 4), device=gs.device, dtype=gs.tc_float)
+        self.base_lin_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.base_ang_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+
+        # adversary state
+        self.adv_actions = torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float)
+        self.adv_last_actions = torch.zeros_like(self.adv_actions)
+        self.adv_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.adv_last_pos = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.adv_quat = torch.zeros((self.num_envs, 4), device=gs.device, dtype=gs.tc_float)
+        self.adv_lin_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.adv_ang_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+
+        # geometry
+        half_thickness = self.env_cfg.get("adv_drone_half_thickness", 0.05)
+        self.z_margin = float(self.env_cfg["z_margin"])
+        self.adv_base_offset = torch.tensor([0.0, 0.0, -(self.z_margin + half_thickness)], device=gs.device, dtype=gs.tc_float)
+
+        self.world_z = torch.tensor([0.0, 0.0, 1.0], device=gs.device, dtype=gs.tc_float).expand(self.num_envs, 3)
+        self.max_tilt_cos = math.cos(math.radians(self.env_cfg["max_tilt_deg"]))
+        self.term_tilt_cos = math.cos(math.radians(self.env_cfg["termination_if_tilt_greater_than"]))
+        self.base_tilt_cos = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+
+        # target kinematics for ego (now the adversary top)
+        self.tgt_vel = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        self.tgt_vel_est = torch.zeros_like(self.tgt_vel)
+        self.tgt_acc_est = torch.zeros_like(self.tgt_vel)
+
+        # approach geometry for ego
+        self.app_geom = (
+            torch.zeros((self.num_envs), device=gs.device),
+            torch.zeros((self.num_envs, 3), device=gs.device),
+            torch.zeros((self.num_envs), device=gs.device),
+            torch.zeros((self.num_envs), device=gs.device),
+        )
+        self.prev_dist = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.prev_vel_close = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+
+        # shaping memory
+        self.prev_v_tan = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+        self.prev_ang_norm = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+        self.prev_yaw_abs = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+
+        # adversary observation stacker (same D,K as ego)
+        D = self.build_obs_template_dim()
+        K = self.env_cfg["obs_stacks"]
+        self.stacker = ObsStacker(self.num_envs, D, K, gs.device)
+        self.adv_stacker = ObsStacker(self.num_envs, D, K, gs.device)
+        self.num_obs = D * K
+        self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=gs.device, dtype=gs.tc_float)
+        self.adv_obs_buf = torch.zeros_like(self.obs_buf)
+
+        # collisions and terms
+        self.adv_collision = torch.zeros((self.num_envs,), device=gs.device, dtype=torch.bool)
+        self.crash_condition = torch.zeros(self.num_envs, dtype=torch.bool, device=gs.device)
+
+        # metrics
+        self.m_d_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_step = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_inside_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_near_cnt = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_vapp_err_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_vtan_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_angvel_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+        self.m_vtgt_sum = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
+
+        self.stable_cnt = torch.zeros(self.num_envs, dtype=torch.int32, device=gs.device)
+        self.n_stable = int(round(self.env_cfg["stable_time_s"] / self.dt))
+        self.success = torch.zeros(self.num_envs, dtype=torch.bool, device=gs.device)
+
+        self.extras = {"observations": {}}
+        self.adv_policy = None  # set via set_adversary_policy()
+
+    # ---------- public API ----------
+    def set_adversary_policy(self, policy_callable):
+        """policy_callable(obs: [N, num_obs]) -> actions: [N, num_actions]"""
+        self.adv_policy = policy_callable
+
+    # ---------- helpers ----------
+    def build_obs_template_dim(self):
+        # build once to learn feature count without side-effects
+        dummy = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
+        return self._concat_obs(
+            rel_pos=dummy, rel_vel=dummy,
+            tgt_vel=dummy, tgt_acc=dummy,
+            dist=torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float),
+            vel_close=torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float),
+            t_go=torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float),
+            target_vector=dummy,
+            base_quat=torch.zeros((self.num_envs, 4), device=gs.device, dtype=gs.tc_float),
+            base_lin=dummy, base_ang=dummy,
+            last_actions=torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float),
+            retarget_flag=torch.zeros((self.num_envs, 1), device=gs.device, dtype=gs.tc_float),
+        ).shape[-1]
+
+    def _concat_obs(self, **tensors):
+        return torch.cat([
+            tensors["rel_pos"].clamp(-1, 1) * self.obs_scales["rel_pos"],
+            tensors["rel_vel"].clamp(-1, 1) * self.obs_scales["lin_vel"],
+            tensors["tgt_vel"] * self.obs_scales.get("tgt_vel", 1 / 3.0),
+            tensors["tgt_acc"] * self.obs_scales.get("tgt_acc", 1 / 10.0),
+            tensors["dist"].unsqueeze(-1),
+            tensors["vel_close"].unsqueeze(-1),
+            tensors["t_go"].unsqueeze(-1),
+            tensors["target_vector"],
+            tensors["base_quat"],
+            tensors["base_lin"] * self.obs_scales["lin_vel"],
+            tensors["base_ang"] * self.obs_scales["ang_vel"],
+            tensors["last_actions"],
+            tensors["retarget_flag"],
+        ], dim=-1)
+
+    def _success_mask(self):
+        near = self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"]
+        slow = self.rel_vel.norm(dim=1) < self.env_cfg["max_rel_speed_mps"]
+        level = self.base_tilt_cos > self.max_tilt_cos
+        angvel = self.base_ang_vel.norm(dim=1) < self.env_cfg["max_angvel_radps"]
+        return near & slow & level & angvel
+
+    def _gaussian_gate(self, dist):
+        decay = max(float(self.env_cfg["near_gate_factor"] * self.env_cfg["at_target_threshold"]), 1e-6)
+        return torch.exp(- (dist / decay) ** 2)
+
+    # ---------- resets and sampling ----------
+    def _resample_commands(self, envs_idx):
+        spawn_clearance = 0.2
+        todo = torch.ones(len(envs_idx), dtype=torch.bool, device=gs.device)
+        MAX_TRIES = 4
+        for _ in range(MAX_TRIES):
+            todo_idx = envs_idx[todo]
+            if todo_idx.numel() == 0:
+                break
+            self.commands[todo_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(todo_idx),), gs.device)
+            self.commands[todo_idx, 1] = gs_rand_float(*self.command_cfg["pos_y_range"], (len(todo_idx),), gs.device)
+            self.commands[todo_idx, 2] = gs_rand_float(*self.command_cfg["pos_z_range"], (len(todo_idx),), gs.device)
+
+            # place ego and adversary far enough in XY
+            rel = self.commands[todo_idx] - self.base_pos[todo_idx]
+            ok = rel[:, :2].norm(dim=1) >= spawn_clearance
+            temp = todo.clone()
+            todo[temp] = ~ok
+
+        # reset rel terms for ego
+        self.rel_pos[envs_idx] = 0.0
+        self.last_rel_pos[envs_idx] = 0.0
+        self.rel_vel[envs_idx] = 0.0
+        self.tgt_vel[envs_idx] = 0.0
+        self.tgt_vel_est[envs_idx] = 0.0
+        self.tgt_acc_est[envs_idx] = 0.0
+
+        # approach cache
+        self.update_approach_geometry(envs_idx)
+        d, _, vel_close, _ = self.app_geom
+        self.prev_dist[envs_idx] = d[envs_idx]
+        self.prev_vel_close[envs_idx] = vel_close[envs_idx]
+        self.prev_v_tan[envs_idx] = 0.0
+
+        self.stable_cnt[envs_idx] = 0
+        self.success[envs_idx] = False
+
+    def reset_idx(self, envs_idx):
+        if len(envs_idx) == 0:
+            return
+        self.episode_length_buf[envs_idx] = 0
+
+        # ego pose
+        self.base_pos[envs_idx] = self.base_init_pos
+        self.last_base_pos[envs_idx] = self.base_init_pos
+        self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
+        self.drone.set_pos(self.base_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.drone.set_quat(self.base_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.base_lin_vel[envs_idx] = 0
+        self.base_ang_vel[envs_idx] = 0
+        self.drone.zero_all_dofs_velocity(envs_idx)
+        self.prev_ang_norm[envs_idx] = 0
+        self.prev_yaw_abs[envs_idx] = 0
+        self.last_actions[envs_idx] = 0.0
+
+        # sample target point
+        self._resample_commands(envs_idx)
+
+        # adversary pose: near its target but not exactly on it
+        jitter_xy = 0.1
+        xy = torch.randn((len(envs_idx), 2), device=gs.device, dtype=gs.tc_float) * jitter_xy
+        adv_base = torch.zeros((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float)
+        adv_base[:, :2] = self.commands[envs_idx, :2] + xy
+        adv_base[:, 2] = (self.commands[envs_idx, 2] + self.adv_base_offset[2])  # <-- fixed
+        self.adv_pos[envs_idx] = adv_base
+        self.adv_last_pos[envs_idx] = adv_base
+        self.adv_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
+        self.adversary.set_pos(self.adv_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.adversary.set_quat(self.adv_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.adv_lin_vel[envs_idx] = 0
+        self.adv_ang_vel[envs_idx] = 0
+        self.adversary.zero_all_dofs_velocity(envs_idx)
+        self.adv_last_actions[envs_idx] = 0.0
+
+        # ego’s tracking point is the adversary top
+        adv_top = self.adv_pos[envs_idx] - self.adv_base_offset
+        self.commands_adv[envs_idx] = adv_top
+        self.last_commands_adv[envs_idx] = adv_top
+
+        # episode stats logging
+        self.extras["episode"] = {}
+
+        # clear metrics
+        for t in [self.m_d_sum, self.m_step, self.m_inside_sum, self.m_vapp_err_sum,
+                self.m_near_cnt, self.m_vtan_sum, self.m_vtgt_sum, self.m_angvel_sum]:
+            t[envs_idx] = 0
+        for k in list(self.episode_sums.keys()):
+            self.episode_sums[k][envs_idx] = 0.0
+
+    def reset(self):
+        self.reset_buf[:] = True
+        self.reset_idx(torch.arange(self.num_envs, device=gs.device))
+
+        # push initial obs for both actors
+        obs_t = self.build_obs()
+        adv_obs_t = self.build_adv_obs()
+        self.stacker.push(obs_t, torch.ones(self.num_envs, dtype=torch.bool, device=gs.device))
+        self.adv_stacker.push(adv_obs_t, torch.ones(self.num_envs, dtype=torch.bool, device=gs.device))
+        self.obs_buf = self.stacker.stacked()
+        self.adv_obs_buf = self.adv_stacker.stacked()
+        return self.obs_buf, None
+
+    # ---------- geometry ----------
+    def calculate_approach_geometry(self, envs_idx=None):
+        rel_pos = self.rel_pos if envs_idx is None else self.rel_pos[envs_idx]
+        rel_vel = self.rel_vel if envs_idx is None else self.rel_vel[envs_idx]
+        d = torch.norm(rel_pos, dim=1)
+        u = rel_pos / d.clamp_min(1e-6).unsqueeze(1)
+        vel_close = - (rel_vel * u).sum(dim=1)
+        t_go = torch.clamp(d / (vel_close.abs() + 1e-3), 0.0, self.env_cfg["tgo_cap"])
+        return d, u, vel_close, t_go
+
+    def update_approach_geometry(self, envs_idx=None):
+        if envs_idx is None:
+            self.app_geom = self.calculate_approach_geometry()
+            return
+        d, u, vel_close, t_go = self.calculate_approach_geometry(envs_idx)
+        d_old, u_old, vel_close_old, t_go_old = self.app_geom
+        d_old[envs_idx] = d
+        u_old[envs_idx] = u
+        vel_close_old[envs_idx] = vel_close
+        t_go_old[envs_idx] = t_go
+        self.app_geom = d_old, u_old, vel_close_old, t_go_old
+
+    # ---------- observations ----------
+    def build_obs(self):
+        # ego tracking adversary top
+        dist, target_vector, vel_close, t_go = self.app_geom
+        retarget_flag = torch.zeros((self.num_envs, 1), device=gs.device, dtype=gs.tc_float)
+        return self._concat_obs(
+            rel_pos=self.rel_pos,
+            rel_vel=self.rel_vel,
+            tgt_vel=self.tgt_vel,
+            tgt_acc=self.tgt_acc_est,
+            dist=torch.clip(dist * self.obs_scales.get("dist", 1.0), 0.0, 2.0),
+            vel_close=torch.clip(vel_close * self.obs_scales.get("vel_close", 1.0), -2.0, 2.0),
+            t_go=t_go * self.obs_scales.get("t_go", 1.0),
+            target_vector=target_vector,
+            base_quat=self.base_quat,
+            base_lin=self.base_lin_vel,
+            base_ang=self.base_ang_vel,
+            last_actions=self.last_actions,
+            retarget_flag=retarget_flag,
+        )
+
+    def build_adv_obs(self):
+        # adversary tracks its own target point = commands (for its top)
+        adv_top = self.adv_pos - self.adv_base_offset
+        adv_rel = self.commands - adv_top
+        adv_last_top = self.adv_last_pos - self.adv_base_offset
+        adv_rel_last = self.commands - adv_last_top
+        adv_rel_vel = (adv_rel - adv_rel_last) / self.dt
+
+        d = torch.norm(adv_rel, dim=1)
+        u = adv_rel / d.clamp_min(1e-6).unsqueeze(1)
+        vel_close = - (adv_rel_vel * u).sum(dim=1)
+        t_go = torch.clamp(d / (vel_close.abs() + 1e-3), 0.0, self.env_cfg["tgo_cap"])
+
+        retarget_flag = torch.zeros((self.num_envs, 1), device=gs.device, dtype=gs.tc_float)
+
+        # body-frame velocities
+        inv_q = inv_quat(self.adv_quat)
+        adv_lin_body = transform_by_quat(self.adv_lin_vel, inv_q)
+        adv_ang_body = transform_by_quat(self.adv_ang_vel, inv_q)
+
+        return self._concat_obs(
+            rel_pos=adv_rel,
+            rel_vel=adv_rel_vel,
+            tgt_vel=torch.zeros_like(adv_rel),       # static target
+            tgt_acc=torch.zeros_like(adv_rel),
+            dist=torch.clip(d * self.obs_scales.get("dist", 1.0), 0.0, 2.0),
+            vel_close=torch.clip(vel_close * self.obs_scales.get("vel_close", 1.0), -2.0, 2.0),
+            t_go=t_go * self.obs_scales.get("t_go", 1.0),
+            target_vector=u,
+            base_quat=self.adv_quat,
+            base_lin=adv_lin_body,
+            base_ang=adv_ang_body,
+            last_actions=self.adv_last_actions,
+            retarget_flag=retarget_flag,
+        )
+
+    def get_observations(self):
+        self.extras["observations"]["critic"] = self.obs_buf
+        return self.obs_buf, self.extras
+
+    def get_privileged_observations(self):
+        return None
+
+    # ---------- step ----------
+    def step(self, actions):
+        # ego actions
+        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        ego_exec = self.actions
+
+        # adversary actions from its policy, if any
+        if self.adv_policy is not None:
+            with torch.no_grad():
+                adv_actions = self.adv_policy(self.adv_obs_buf)
+            self.adv_actions = torch.clip(adv_actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        else:
+            self.adv_actions[:] = 0.0
+
+        # apply RPMs (14468 is hover)
+        self.drone.set_propellels_rpm((1 + ego_exec * 0.8) * 14468.429183500699)
+        self.adversary.set_propellels_rpm((1 + self.adv_actions * 0.8) * 14468.429183500699)
+
+        # advance physics
+        self.scene.step()
+        self.episode_length_buf += 1
+
+        # ego state
+        self.last_base_pos.copy_(self.base_pos)
+        pos = self.drone.get_pos(); quat = self.drone.get_quat()
+        lin = self.drone.get_vel(); ang = self.drone.get_ang()
+        pos.nan_to_num_(nan=0.0); quat.nan_to_num_(nan=0.0); lin.nan_to_num_(nan=0.0); ang.nan_to_num_(nan=0.0)
+        quat = quat / quat.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        inv_q = inv_quat(quat)
+        self.base_pos.copy_(pos); self.base_quat.copy_(quat)
+        self.base_lin_vel.copy_(transform_by_quat(lin, inv_q))
+        self.base_ang_vel.copy_(transform_by_quat(ang, inv_q))
+
+        # adversary state
+        self.adv_last_pos.copy_(self.adv_pos)
+        ap = self.adversary.get_pos(); aq = self.adversary.get_quat()
+        al = self.adversary.get_vel(); aa = self.adversary.get_ang()
+        ap.nan_to_num_(nan=0.0); aq.nan_to_num_(nan=0.0); al.nan_to_num_(nan=0.0); aa.nan_to_num_(nan=0.0)
+        aq = aq / aq.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        self.adv_pos.copy_(ap); self.adv_quat.copy_(aq)
+        self.adv_lin_vel.copy_(al); self.adv_ang_vel.copy_(aa)
+
+        # ego target is adversary top
+        adv_top = self.adv_pos - self.adv_base_offset
+        self.last_commands_adv.copy_(self.commands_adv)
+        self.commands_adv.copy_(adv_top)
+        meas_tgt_vel = (self.commands_adv - self.last_commands_adv) / self.dt
+        self.tgt_vel_est = 0.8 * self.tgt_vel_est + 0.2 * meas_tgt_vel
+        meas_tgt_acc = (self.tgt_vel_est - self.tgt_vel) / self.dt
+        self.tgt_acc_est = 0.9 * self.tgt_acc_est + 0.1 * meas_tgt_acc
+        self.tgt_vel = self.tgt_vel_est
+
+        # relative kinematics for ego
+        self.last_rel_pos.copy_(self.rel_pos)
+        self.rel_pos.copy_(self.commands_adv - self.base_pos)
+        self.rel_vel.copy_((self.rel_pos - self.last_rel_pos) / self.dt)
+
+        # approach geometry
+        d_prev, _, vc_prev, _ = self.app_geom
+        self.prev_dist.copy_(d_prev)
+        self.prev_vel_close.copy_(vc_prev)
+        self.update_approach_geometry()
+
+        # contacts
+        adv_contact = self.adversary.get_contacts(with_entity=self.drone, exclude_self_contact=True)
+        self.adv_collision = (adv_contact['penetration'] > 0).any(dim=1)
+
+        # metrics
+        d, u, vel_close, _ = self.app_geom
+        v_des = torch.clamp(self.env_cfg["approach_k"] * d, max=self.env_cfg["approach_v_cap"])
+        sigma = max(self.env_cfg["near_gate_factor"] * self.env_cfg["at_target_threshold"], self.env_cfg["at_target_threshold"])
+        v_tan = self.rel_vel - (self.rel_vel * u).sum(dim=1, keepdim=True) * u
+        w_norm = self.base_ang_vel.norm(dim=1)
+
+        self.m_d_sum += d; self.m_step += 1
+        self.m_inside_sum += (d < self.env_cfg["at_target_threshold"]).float()
+        self.m_vtgt_sum += self.tgt_vel.norm(dim=1)
+        mask = d < sigma
+        self.m_near_cnt += mask.float()
+        self.m_vapp_err_sum += torch.where(mask, (v_des - vel_close).abs(), 0.0)
+        self.m_vtan_sum += torch.where(mask, v_tan.norm(dim=1), 0.0)
+        self.m_angvel_sum += torch.where(mask, w_norm, 0.0)
+
+        # tilt
+        self.base_tilt_cos = transform_by_quat(self.world_z, inv_q)[:, 2].clamp(-1.0, 1.0)
+
+        # success and terms (ego only)
+        success_mask = self._success_mask()
+        below_plane = self.base_pos[:, 2] < (self.commands_adv[:, 2] - self.z_margin)
+        adv_hard_hit = self.adv_collision & (~success_mask) & below_plane
+        tilt_term = (self.base_tilt_cos < self.term_tilt_cos)
+        x_term = (torch.abs(self.rel_pos[:, 0]) > self.env_cfg["termination_if_x_greater_than"])
+        y_term = (torch.abs(self.rel_pos[:, 1]) > self.env_cfg["termination_if_y_greater_than"])
+        z_term = (torch.abs(self.rel_pos[:, 2]) > self.env_cfg["termination_if_z_greater_than"])
+        angvel_term = (torch.abs(self.base_ang_vel.norm(dim=1)) > self.env_cfg["termination_if_angvel_greater_than"])
+        floor_term = (self.base_pos[:, 2] < self.env_cfg["termination_if_close_to_ground"])
+
+        self.extras["term_causes_now"] = {
+            "term_tilt": tilt_term.float(),
+            "term_x": x_term.float(),
+            "term_y": y_term.float(),
+            "term_z": z_term.float(),
+            "term_yaw": angvel_term.float(),
+            "term_floor": floor_term.float(),
+            "term_adv_hit": adv_hard_hit.float(),
+        }
+        self.crash_condition = (tilt_term | x_term | y_term | z_term | angvel_term | floor_term | adv_hard_hit)
+
+        self.stable_cnt = torch.where(success_mask, (self.stable_cnt + 1).clamp_max(self.n_stable), torch.zeros_like(self.stable_cnt))
+        self.success = self.stable_cnt >= self.n_stable
+
+        # target visualize = adversary top
+        if self.target is not None:
+            near = (self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"])
+            threshold_pos = torch.where(near.unsqueeze(1), self.commands_adv, self.highlight_hide)
+            reached_pos = torch.where(success_mask.unsqueeze(1), self.commands_adv, self.highlight_hide)
+            self.target.set_pos(self.commands_adv, zero_velocity=True)
+            self.target_threshold_highlight.set_pos(threshold_pos, zero_velocity=True)
+            self.target_reached_highlight.set_pos(reached_pos, zero_velocity=True)
+
+        # rewards
+        self.rew_buf[:] = 0.0
+        for name, reward_func in self.reward_functions.items():
+            rew = reward_func() * self.reward_scales[name]
+            rew = torch.nan_to_num(rew, 0.0, 0.0, 0.0).clamp_(-1000.0, 1000.0)
+            self.rew_buf += rew
+            self.episode_sums[name] += rew
+
+        # resets (ego only)
+        self.reset_buf = (self.episode_length_buf > self.max_episode_length) | self.crash_condition
+        time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).flatten()
+        self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=gs.device, dtype=gs.tc_float)
+        self.extras["time_outs"][time_out_idx] = 1.0
+
+        reset_idx_now = self.reset_buf.nonzero(as_tuple=False).flatten()
+        self.extras["term_timeout"] = torch.zeros_like(self.reset_buf, device=gs.device, dtype=gs.tc_float)
+        self.extras["term_timeout"][(self.episode_length_buf > self.max_episode_length)] = 1.0
+        self.extras["term_reset_idx_now"] = reset_idx_now
+
+        self.reset_idx(reset_idx_now)
+
+        # resample after success
+        envs_idx = torch.nonzero(self.success, as_tuple=False).flatten()
+        self._resample_commands(envs_idx)
+
+        # observations for next step
+        obs_t = torch.clamp(torch.nan_to_num(self.build_obs(), nan=0.0, posinf=1e6, neginf=-1e6), -100.0, 100.0)
+        adv_obs_t = torch.clamp(torch.nan_to_num(self.build_adv_obs(), nan=0.0, posinf=1e6, neginf=-1e6), -100.0, 100.0)
+
+        done = self.reset_buf.bool(); done[envs_idx] = True
+        self.stacker.push(obs_t, done)
+        self.adv_stacker.push(adv_obs_t, done)
+        self.obs_buf = self.stacker.stacked()
+        self.adv_obs_buf = self.adv_stacker.stacked()
+
+        self.last_actions[:] = self.actions[:]
+        self.adv_last_actions[:] = self.adv_actions[:]
+        self.extras["observations"]["critic"] = self.obs_buf
+        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
+
+    # ---------- rewards ----------
+    def _reward_approach(self):
+        dist, _, vel_close, _ = self.app_geom
+        dist_prev, vel_close_prev = self.prev_dist, self.prev_vel_close
+        k, v_cap = self.env_cfg["approach_k"], self.env_cfg["approach_v_cap"]
+        dist_soft = self.env_cfg["near_gate_factor"] * self.env_cfg["at_target_threshold"]
+        vel_soft = 0.05
+
+        def phi(d, v):
+            dist_target = torch.zeros_like(d)
+            vel_target = torch.clamp(k * d, max=v_cap)
+            dist_rew = functional.smooth_l1_loss(d, dist_target, beta=dist_soft, reduction="none")
+            vel_rew = functional.smooth_l1_loss(v, vel_target, beta=vel_soft, reduction="none")
+            return dist_rew + vel_rew
+
+        return phi(dist_prev, vel_close_prev) - phi(dist, vel_close)
+
+    def _reward_tan_vel_align(self):
+        dist, u, _, _ = self.app_geom
+        gate = self._gaussian_gate(dist)
+        gate_prev = self._gaussian_gate(self.prev_dist)
+        v_tan = (self.rel_vel - (self.rel_vel * u).sum(dim=1, keepdim=True) * u).norm(dim=1)
+        v_tan_rew = gate_prev * self.prev_v_tan - gate * v_tan
+        self.prev_v_tan.copy_(v_tan)
+        return v_tan_rew
+
+    def _reward_smooth(self):
+        return -torch.sum(torch.square(self.actions - self.last_actions), dim=1)
+
+    def _reward_ang_vel(self):
+        dist, _, _, _ = self.app_geom
+        gate = self._gaussian_gate(dist)
+        gate_prev = self._gaussian_gate(self.prev_dist)
+        ang_norm = self.base_ang_vel.norm(dim=1)
+        yaw_abs = self.base_ang_vel[:, 2].abs()
+        angvel_near_rew = gate_prev * self.prev_ang_norm - gate * ang_norm
+        yaw_rew = (self.prev_yaw_abs - yaw_abs)
+        self.prev_ang_norm.copy_(ang_norm)
+        self.prev_yaw_abs.copy_(yaw_abs)
+        return angvel_near_rew + yaw_rew
+
+    def _reward_crash(self):
+        crash = self.crash_condition.float()
+        impact = self.rel_vel.norm(dim=1) + 0.5 * self.base_ang_vel.norm(dim=1)
+        return -(crash * (1.0 + impact))
+
+    def _reward_success(self):
+        return self.success.to(self.rew_buf.dtype)
