@@ -4,6 +4,7 @@ import os
 import pickle
 import copy
 from importlib import metadata
+from tqdm import trange
 
 import torch
 
@@ -42,9 +43,9 @@ def main():
     env_cfg["z_margin"] = 0.00
 
     # Eval-only safety and visuals.
-    env_cfg["episode_length_s"] = 20.0
-    env_cfg["adv_max_v"] = 0.5
-    env_cfg["adv_min_v"] = 0.5
+    env_cfg["episode_length_s"] = 60.0
+    env_cfg["adv_max_v"] = 2.0
+    env_cfg["adv_min_v"] = 2.0
     env_cfg["termination_if_tilt_greater_than"] = 170.0
     env_cfg["termination_if_angvel_greater_than"] = 100.0
     env_cfg["visualize_target"] = True
@@ -88,13 +89,13 @@ def main():
     with torch.no_grad():
         if args.record:
             env.cam.start_recording()
-            for _ in range(max_sim_step):
+            for _ in trange(max_sim_step):
                 actions = policy_ego(obs)
                 obs, rews, dones, infos = env.step(actions)
                 env.cam.render()
-            env.cam.stop_recording(save_to_filename=f"{args.exp_name}.mp4", fps=env_cfg["max_visualize_FPS"])
+            env.cam.stop_recording(fps=env_cfg["max_visualize_FPS"])
         else:
-            for _ in range(max_sim_step):
+            for _ in trange(max_sim_step):
                 actions = policy_ego(obs)
                 obs, rews, dones, infos = env.step(actions)
 

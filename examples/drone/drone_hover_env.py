@@ -112,7 +112,7 @@ class HoverEnv:
             sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
             viewer_options=gs.options.ViewerOptions(
                 max_FPS=env_cfg["max_visualize_FPS"],
-                camera_pos=(3.0, 0.0, 3.0),
+                camera_pos=(4.0, 0.0, 4.0),
                 camera_lookat=(0.0, 0.0, 1.0),
                 camera_fov=40,
             ),
@@ -124,6 +124,7 @@ class HoverEnv:
                 enable_joint_limit=True,
             ),
             show_viewer=show_viewer,
+            show_FPS=False,
         )
         self.scene.add_entity(gs.morphs.Plane())
 
@@ -141,10 +142,11 @@ class HoverEnv:
                 morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.052, fixed=False, collision=False),
                 surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.0, 1.0, 0.0))),
             )
-            self.adv_target_marker = self.scene.add_entity(
-                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.04, fixed=False, collision=False),
-                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.2, 0.4, 1.0))),
-            )
+            self.adv_target_marker = None
+            # self.adv_target_marker = self.scene.add_entity(
+            #     morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.04, fixed=False, collision=False),
+            #     surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.2, 0.4, 1.0))),
+            # )
             self.highlight_hide = torch.tensor([0.0, 0.0, -1.0], device=gs.device, dtype=gs.tc_float)
         else:
             self.target = None
@@ -163,7 +165,12 @@ class HoverEnv:
         # optional camera
         if self.env_cfg.get("visualize_camera", False):
             self.cam = self.scene.add_camera(
-                res=(960, 540), pos=(3.5, 0.0, 2.5), lookat=(0, 0, 0.5), fov=30, GUI=True
+                # res=(960, 540),
+                res=(1920, 1080),
+                pos=(4.0, 0.0, 4.0),
+                lookat=(0, 0, 1.0),
+                fov=30,
+                GUI=True
             )
 
         # constants
@@ -303,21 +310,21 @@ class HoverEnv:
             retarget_flag=torch.zeros((self.num_envs, 1), device=gs.device, dtype=gs.tc_float),
         ).shape[-1]
 
-    def _concat_obs(self, **tensors):
+    def _concat_obs(self, **t):
         return torch.cat([
-            tensors["rel_pos"].clamp(-1, 1) * self.obs_scales["rel_pos"],
-            tensors["rel_vel"].clamp(-1, 1) * self.obs_scales["lin_vel"],
-            tensors["tgt_vel"] * self.obs_scales.get("tgt_vel", 1 / 3.0),
-            tensors["tgt_acc"] * self.obs_scales.get("tgt_acc", 1 / 10.0),
-            tensors["dist"].unsqueeze(-1),
-            tensors["vel_close"].unsqueeze(-1),
-            tensors["t_go"].unsqueeze(-1),
-            tensors["target_vector"],
-            tensors["base_quat"],
-            tensors["base_lin"] * self.obs_scales["lin_vel"],
-            tensors["base_ang"] * self.obs_scales["ang_vel"],
-            tensors["last_actions"],
-            tensors["retarget_flag"],
+            torch.clip(t["rel_pos"] * self.obs_scales["rel_pos"], -1, 1),
+            torch.clip(t["rel_vel"] * self.obs_scales["lin_vel"], -1, 1),
+            torch.clip(t["tgt_vel"] * self.obs_scales.get("tgt_vel", 1/3.0), -1, 1),
+            torch.clip(t["tgt_acc"] * self.obs_scales.get("tgt_acc", 1/10.0), -1, 1),
+            torch.clip(t["dist"] * self.obs_scales.get("dist", 1.0), 0.0, 2.0).unsqueeze(-1),
+            torch.clip(t["vel_close"] * self.obs_scales.get("vel_close", 1.0), -2.0, 2.0).unsqueeze(-1),
+            (t["t_go"] * self.obs_scales.get("t_go", 1.0)).unsqueeze(-1),
+            t["target_vector"],
+            t["base_quat"],
+            torch.clip(t["base_lin"] * self.obs_scales["lin_vel"], -1, 1),
+            torch.clip(t["base_ang"] * self.obs_scales["ang_vel"], -1, 1),
+            t["last_actions"],
+            t["retarget_flag"],
         ], dim=-1)
 
     def _success_mask(self):
@@ -325,7 +332,7 @@ class HoverEnv:
         slow = self.rel_vel.norm(dim=1) < self.env_cfg["max_rel_speed_mps"]
         level = self.base_tilt_cos > self.max_tilt_cos
         angvel = self.base_ang_vel.norm(dim=1) < self.env_cfg["max_angvel_radps"]
-        return near & slow & level & angvel
+        return near# & slow & level & angvel
 
     def _gaussian_gate(self, dist):
         decay = max(float(self.env_cfg["near_gate_factor"] * self.env_cfg["at_target_threshold"]), 1e-6)
@@ -411,27 +418,8 @@ class HoverEnv:
 
         # sample target point
         self._resample_commands(envs_idx)
+        self._respawn_leader_only(envs_idx)
 
-        # adversary pose: near its target but not exactly on it
-        jitter_xy = 0.3
-        xy = torch.randn((len(envs_idx), 2), device=gs.device, dtype=gs.tc_float) * jitter_xy
-        adv_base = torch.zeros((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float)
-        adv_base[:, :2] = self.commands[envs_idx, :2] + xy
-        adv_base[:, 2] = (self.commands[envs_idx, 2] + self.adv_base_offset[2])
-        self.adv_pos[envs_idx] = adv_base
-        self.adv_last_pos[envs_idx] = adv_base
-        self.adv_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
-        self.adversary.set_pos(self.adv_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
-        self.adversary.set_quat(self.adv_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
-        self.adv_lin_vel[envs_idx] = 0
-        self.adv_ang_vel[envs_idx] = 0
-        self.adversary.zero_all_dofs_velocity(envs_idx)
-        self.adv_last_actions[envs_idx] = 0.0
-
-        # ego’s tracking point is the adversary top
-        adv_top = self.adv_pos[envs_idx] - self.adv_base_offset
-        self.commands_adv[envs_idx] = adv_top
-        self.last_commands_adv[envs_idx] = adv_top
 
         # episode stats logging
         self.extras["episode"] = {}
@@ -442,6 +430,39 @@ class HoverEnv:
             t[envs_idx] = 0
         for k in list(self.episode_sums.keys()):
             self.episode_sums[k][envs_idx] = 0.0
+
+    def _respawn_leader_only(self, envs_idx):
+        if len(envs_idx) == 0:
+            return
+        jitter_xy = 0.3
+        xy = torch.randn((len(envs_idx), 2), device=gs.device, dtype=gs.tc_float) * jitter_xy
+        adv_base = torch.zeros((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float)
+        adv_base[:, :2] = self.commands[envs_idx, :2] + xy
+        adv_base[:, 2]  = (self.commands[envs_idx, 2] + self.adv_base_offset[2])
+
+        self.adv_pos[envs_idx] = adv_base
+        self.adv_last_pos[envs_idx] = adv_base
+        self.adv_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
+        self.adversary.set_pos(self.adv_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.adversary.set_quat(self.adv_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.adv_lin_vel[envs_idx] = 0
+        self.adv_ang_vel[envs_idx] = 0
+        self.adversary.zero_all_dofs_velocity(envs_idx)
+        self.adv_last_actions[envs_idx] = 0.0
+
+        # follower aims slightly above leader top (+5 cm)
+        adv_top = self.adv_pos[envs_idx] - self.adv_base_offset + 0.05 * self.world_z[envs_idx]
+        self.commands_adv[envs_idx] = adv_top
+        self.last_commands_adv[envs_idx] = adv_top
+
+        # keep ego; refresh relative state and caches
+        self.rel_pos[envs_idx] = self.commands_adv[envs_idx] - self.base_pos[envs_idx]
+        self.last_rel_pos[envs_idx] = self.rel_pos[envs_idx]
+        self.rel_vel[envs_idx] = 0.0
+        self.update_approach_geometry(envs_idx)
+        d, _, vel_close, _ = self.app_geom
+        self.prev_dist[envs_idx] = d[envs_idx]
+        self.prev_vel_close[envs_idx] = vel_close[envs_idx]
 
     def reset(self):
         self.reset_buf[:] = True
@@ -589,8 +610,8 @@ class HoverEnv:
         self.adv_pos.copy_(ap); self.adv_quat.copy_(aq)
         self.adv_lin_vel.copy_(al); self.adv_ang_vel.copy_(aa)
 
-        # ego target is adversary top
-        adv_top = self.adv_pos - self.adv_base_offset
+        # ego target is above adversary top
+        adv_top = self.adv_pos - self.adv_base_offset + 0.2 * self.world_z
         self.last_commands_adv.copy_(self.commands_adv)
         self.commands_adv.copy_(adv_top)
         meas_tgt_vel = (self.commands_adv - self.last_commands_adv) / self.dt
@@ -693,6 +714,7 @@ class HoverEnv:
         # resample after success
         envs_idx = torch.nonzero(self.success, as_tuple=False).flatten()
         self._resample_commands(envs_idx)
+        self._respawn_leader_only(envs_idx)
 
         # observations for next step
         obs_t = torch.clamp(torch.nan_to_num(self.build_obs(), nan=0.0, posinf=1e6, neginf=-1e6), -100.0, 100.0)
