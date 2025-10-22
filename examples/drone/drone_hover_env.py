@@ -589,16 +589,23 @@ class HoverEnv:
 
         # actions
         if self.train_role == "ego":
-            ego_act = actions
-            with torch.no_grad():
-                adv_act = self.opp_adv(self.adv_obs_buf) if self.opp_adv else torch.zeros_like(actions)
+            # PPO controls ego; adversary comes from its policy
+            self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+            if self.adv_policy is not None:
+                with torch.no_grad():
+                    adv_act = self.adv_policy(self.adv_obs_buf)
+                self.adv_actions = torch.clip(adv_act, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+            else:
+                self.adv_actions[:] = 0.0
         else:
-            adv_act = actions
-            with torch.no_grad():
-                ego_act = self.opp_ego(self.obs_buf) if self.opp_ego else torch.zeros_like(actions)
-
-        self.actions        = torch.clip(ego_act, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
-        self.adv_actions    = torch.clip(adv_act, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+            # PPO controls adversary; ego comes from frozen opponent
+            self.adv_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+            if self._ego_opponent is not None:
+                with torch.no_grad():
+                    ego_act = self._ego_opponent(self.obs_buf)
+                self.actions = torch.clip(ego_act, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+            else:
+                self.actions[:] = 0.0
 
         # apply RPMs (14468 is hover)
         self.drone.set_propellels_rpm((1 + self.actions * 0.8) * 14468.429183500699)
