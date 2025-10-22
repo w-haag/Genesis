@@ -288,10 +288,23 @@ class HoverEnv:
         self.path_f = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
         self.path_phi = torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float)
 
+        # ARL setup
+        self.train_role = "ego"           # "ego" | "adv"
+        self._ego_opponent = None         # frozen ego policy when training adversary
+        self.adv_rew_buf = torch.zeros_like(self.rew_buf)
+        # logging buckets for adversary
+        self.adv_episode_sums = {"adv_evasion": torch.zeros_like(self.rew_buf),
+                                 "adv_caught":  torch.zeros_like(self.rew_buf),
+                                 "adv_smooth":  torch.zeros_like(self.rew_buf)}
+
     # ---------- public API ----------
     def set_adversary_policy(self, policy_callable):
         """policy_callable(obs: [N, num_obs]) -> actions: [N, num_actions]"""
         self.adv_policy = policy_callable
+    def set_ego_policy(self, policy_callable):
+        self._ego_opponent = policy_callable
+    def set_train_role(self, role:str):
+        assert role in ("ego","adv"); self.train_role = role
 
     # ---------- helpers ----------
     def build_obs_template_dim(self):
@@ -557,8 +570,12 @@ class HoverEnv:
         )
 
     def get_observations(self):
-        self.extras["observations"]["critic"] = self.obs_buf
-        return self.obs_buf, self.extras
+        if self.train_role == "ego":
+            self.extras["observations"]["critic"] = self.obs_buf
+            return self.obs_buf, self.extras
+        else:
+            self.extras["observations"]["critic"] = self.adv_obs_buf
+            return self.adv_obs_buf, self.extras
 
     def get_privileged_observations(self):
         return None
@@ -570,20 +587,21 @@ class HoverEnv:
         path = self.path_a * torch.sin(math.tau * self.path_f * t + self.path_phi)
         self.commands = self.commands_anchor + path
 
-        # ego actions
-        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
-        ego_exec = self.actions
-
-        # adversary actions from its policy, if any
-        if self.adv_policy is not None:
+        # actions
+        if self.train_role == "ego":
+            ego_act = actions
             with torch.no_grad():
-                adv_actions = self.adv_policy(self.adv_obs_buf)
-            self.adv_actions = torch.clip(adv_actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+                adv_act = self.opp_adv(self.adv_obs_buf) if self.opp_adv else torch.zeros_like(actions)
         else:
-            self.adv_actions[:] = 0.0
+            adv_act = actions
+            with torch.no_grad():
+                ego_act = self.opp_ego(self.obs_buf) if self.opp_ego else torch.zeros_like(actions)
+
+        self.actions        = torch.clip(ego_act, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        self.adv_actions    = torch.clip(adv_act, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
 
         # apply RPMs (14468 is hover)
-        self.drone.set_propellels_rpm((1 + ego_exec * 0.8) * 14468.429183500699)
+        self.drone.set_propellels_rpm((1 + self.actions * 0.8) * 14468.429183500699)
         self.adversary.set_propellels_rpm((1 + self.adv_actions * 0.8) * 14468.429183500699)
 
         # advance physics
@@ -691,12 +709,31 @@ class HoverEnv:
                 self.adv_target_marker.set_pos(self.commands, zero_velocity=True)
 
         # rewards
-        self.rew_buf[:] = 0.0
-        for name, reward_func in self.reward_functions.items():
-            rew = reward_func() * self.reward_scales[name]
-            rew = torch.nan_to_num(rew, 0.0, 0.0, 0.0).clamp_(-1000.0, 1000.0)
-            self.rew_buf += rew
-            self.episode_sums[name] += rew
+        if self.train_role == "ego":
+            self.rew_buf[:] = 0.0
+            for name, reward_func in self.reward_functions.items():
+                rew = reward_func() * self.reward_scales[name]
+                rew = torch.nan_to_num(rew, 0.0, 0.0, 0.0).clamp_(-1000.0, 1000.0)
+                self.rew_buf += rew
+                self.episode_sums[name] += rew
+        else:
+            # adversary evasion reward: increase separation, penalize capture, small smoothness
+            adv_top = self.adv_pos - self.adv_base_offset
+            adv_rel = self.commands - adv_top
+            d = torch.norm(adv_rel, dim=1)
+            if not hasattr(self, "_prev_adv_d"):
+                self._prev_adv_d = d.clone()
+            r_evasion = (d - self._prev_adv_d)        # positive if getting farther
+            self._prev_adv_d = d
+            r_caught = self.success.float()           # ego success == capture
+            r_smooth = (self.adv_actions - self.adv_last_actions).pow(2).sum(dim=1)
+            # scales comparable to ego magnitudes; dt already ~0.01
+            adv_rew = 2.0 * r_evasion - 5.0 * r_caught - 0.5 * r_smooth
+            self.adv_rew_buf = torch.nan_to_num(adv_rew, 0.0, 0.0, 0.0).clamp_(-1000.0, 1000.0)
+            # log into separate buckets
+            self.adv_episode_sums["adv_evasion"] += 2.0 * r_evasion
+            self.adv_episode_sums["adv_caught"]  += -5.0 * r_caught
+            self.adv_episode_sums["adv_smooth"]  += -0.5 * r_smooth
 
         # resets (ego only)
         self.reset_buf = (self.episode_length_buf > self.max_episode_length) | self.crash_condition
@@ -728,8 +765,15 @@ class HoverEnv:
 
         self.last_actions[:] = self.actions[:]
         self.adv_last_actions[:] = self.adv_actions[:]
-        self.extras["observations"]["critic"] = self.obs_buf
-        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
+
+        # choose obs/reward by role before return
+        if self.train_role == "ego":
+            obs, rew = self.obs_buf, self.rew_buf
+        else:
+            obs, rew = self.adv_obs_buf, self.adv_rew_buf  # see reward below
+
+        self.extras["observations"]["critic"] = obs
+        return obs, rew, self.reset_buf, self.extras
 
     # ---------- rewards ----------
     def _reward_approach(self):
