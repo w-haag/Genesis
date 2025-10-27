@@ -11,14 +11,18 @@ def get_train_cfg(exp_name, max_iterations):
     return {
         "algorithm": {
             "class_name": "PPO",
-            "clip_param": 0.2, "desired_kl": 0.01,
+            "clip_param": 0.2,
+			"desired_kl": 0.01,
             "entropy_coef": 0.004,
-            "gamma": 0.99, "lam": 0.95,
+            "gamma": 0.99,
+			"lam": 0.95,
             "learning_rate": 3e-4,
             "max_grad_norm": 1.0,
-            "num_learning_epochs": 5, "num_mini_batches": 4,
+            "num_learning_epochs": 5,
+			"num_mini_batches": 4,
             "schedule": "adaptive",
-            "use_clipped_value_loss": True, "value_loss_coef": 1.0,
+            "use_clipped_value_loss": True,
+			"value_loss_coef": 1.0,
         },
         "policy": {
             "class_name": "ActorCritic",
@@ -29,10 +33,14 @@ def get_train_cfg(exp_name, max_iterations):
         },
         "runner": {
             "experiment_name": exp_name,
-            "checkpoint": -1, "load_run": -1,
-            "log_interval": 1, "record_interval": -1,
-            "resume": False, "resume_path": None,
-            "max_iterations": max_iterations, "run_name": "",
+            "checkpoint": -1,
+			"load_run": -1,
+            "log_interval": 1,
+			"record_interval": -1,
+            "resume": False,
+			"resume_path": None,
+            "max_iterations": max_iterations,
+			"run_name": "",
         },
         "runner_class_name": "OnPolicyRunner",
         "num_steps_per_env": 100,
@@ -43,7 +51,8 @@ def get_train_cfg(exp_name, max_iterations):
 
 def get_cfgs():
     env_cfg = {
-        "num_actions": 4, "obs_stacks": 20,
+        "num_actions": 4,
+        "obs_stacks": 20,
         "base_init_pos": [0.0, 0.0, 1.5],
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
         "episode_length_s": 15.0,
@@ -67,20 +76,44 @@ def get_cfgs():
         "max_tilt_deg": 10.0,
         "max_angvel_radps": 1.5,
         "stable_time_s": 0.10,
-        "approach_k": 2.0, "approach_v_cap": 1.0,
-        "near_gate_factor": 2.0, "tgo_cap": 3.0,
+        "approach_k": 2.0,
+        "approach_v_cap": 1.0,
+        "near_gate_factor": 2.0,
+        "tgo_cap": 3.0,
         "angvel_excess_margin_radps": 0.5,
         # adversary path + geometry
-        "adv_min_v": 0.5, "adv_max_v": 1.0, "adv_max_f": 1.0,
-        "z_margin": 0.05, "adv_drone_half_thickness": 0.05,
+        "adv_min_v": 0.5,
+        "adv_max_v": 1.0,
+        "adv_max_f": 1.0,
+        "z_margin": 0.05,
+        "adv_drone_half_thickness": 0.05,
         # make adversary policy-driven
-        "adversary_control": "policy", "adversary_is_drone": True,
+        "adversary_control": "policy",
+        "adversary_is_drone": True,
     }
-    obs_cfg = {"obs_scales": {"rel_pos": 1/3.0, "lin_vel": 1/3.0, "ang_vel": 1/3.14159}}
+    obs_cfg = {
+        "obs_scales": {
+			"rel_pos": 1/3.0,
+            "lin_vel": 1/3.0,
+            "ang_vel": 1/3.14159
+        }
+    }
     reward_cfg = {  # ego rewards (env auto-dt-scales non-events and sums into episode_sums)
-        "reward_scales": {"approach":500.0,"tan_vel_align":1.0,"smooth":0.5,"ang_vel":0.25,"crash":100.0,"success":5.0}
+        "reward_scales": {
+			"approach":500.0,
+			"tan_vel_align":1.0,
+			"smooth":0.5,
+			"ang_vel":0.25,
+			"crash":100.0,
+			"success":5.0
+        }
     }
-    command_cfg = {"num_commands": 3, "pos_x_range":[-1,1],"pos_y_range":[-1,1],"pos_z_range":[1,1]}
+    command_cfg = {
+        "num_commands": 3,
+        "pos_x_range":[-1,1],
+        "pos_y_range":[-1,1],
+        "pos_z_range":[1,1]
+    }
     return env_cfg, obs_cfg, reward_cfg, command_cfg
 
 def check_lib():
