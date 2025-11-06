@@ -3,6 +3,8 @@ import argparse, os, pickle, shutil, copy, random
 from importlib import metadata
 import torch
 from rsl_rl.runners import OnPolicyRunner
+from collections import deque
+import random, copy
 
 import genesis as gs
 from drone_hover_env import HoverEnv  # same env for both roles
@@ -12,8 +14,8 @@ def get_train_cfg(exp_name, max_iterations):
         "algorithm": {
             "class_name": "PPO",
             "clip_param": 0.2,
-			"desired_kl": 0.01,
-            "entropy_coef": 0.004,
+			"desired_kl": 0.02,
+            "entropy_coef": 0.002,
             "gamma": 0.99,
 			"lam": 0.95,
             "learning_rate": 3e-4,
@@ -44,7 +46,7 @@ def get_train_cfg(exp_name, max_iterations):
         },
         "runner_class_name": "OnPolicyRunner",
         "num_steps_per_env": 100,
-        "save_interval": 100,
+        "save_interval": 50,
         "empirical_normalization": True,
         "seed": 1,
     }
@@ -61,15 +63,11 @@ def get_cfgs():
         "visualize_target": False,
         "visualize_camera": False,
         "max_visualize_FPS": 60,
+        "eval": False,
         # safety / terms
-        "termination_if_roll_greater_than": 80,
-        "termination_if_pitch_greater_than": 80,
         "termination_if_tilt_greater_than": 80,
         "termination_if_close_to_ground": 0.1,
-        "termination_if_x_greater_than": 3.0,
-        "termination_if_y_greater_than": 3.0,
-        "termination_if_z_greater_than": 3.0,
-        "termination_if_angvel_greater_than": 3.0,
+        "termination_if_yaw_rate_greater_than": 3.0,
         # success + shaping
         "at_target_threshold": 0.10,
         "max_rel_speed_mps": 0.2,
@@ -81,15 +79,12 @@ def get_cfgs():
         "near_gate_factor": 2.0,
         "tgo_cap": 3.0,
         "angvel_excess_margin_radps": 0.5,
-        # adversary path + geometry
-        "adv_min_v": 0.5,
-        "adv_max_v": 1.0,
+        # adversary path + geometry # TODO curriculum has gone missing?!?
+        "adv_min_v": 0.0,
+        "adv_max_v": 0.0,
         "adv_max_f": 1.0,
         "z_margin": 0.05,
         "adv_drone_half_thickness": 0.05,
-        # make adversary policy-driven
-        "adversary_control": "policy",
-        "adversary_is_drone": True,
     }
     obs_cfg = {
         "obs_scales": {
@@ -100,12 +95,23 @@ def get_cfgs():
     }
     reward_cfg = {  # ego rewards (env auto-dt-scales non-events and sums into episode_sums)
         "reward_scales": {
-			"approach":500.0,
-			"tan_vel_align":1.0,
-			"smooth":0.5,
-			"ang_vel":0.25,
-			"crash":100.0,
-			"success":5.0
+            "approach":         500.0,
+            "tan_vel_align":    100.0,
+            "smooth":           5.0,
+            "ang_vel":          25.0,
+            "crash":            20.0,
+            "success":          0.5,
+            "adv_success":      -1.0,
+        },
+        "adv_reward_scales": {
+            "adv_approach":     500.0,
+            "adv_escape":       500.0,
+            "tan_vel_align":    50.0,
+            "smooth":           5.0,
+            "ang_vel":          25.0,
+            "crash":            20.0,
+            "success":          -0.5,
+            "adv_success":      1.0,
         }
     }
     command_cfg = {
@@ -115,6 +121,32 @@ def get_cfgs():
         "pos_z_range":[1,1]
     }
     return env_cfg, obs_cfg, reward_cfg, command_cfg
+
+class OpponentPool:
+    def __init__(self, capacity=20, p_newest=0.67, device=None):
+        self.cap = capacity
+        self.p_newest = p_newest
+        self.device = device
+        self.buf = deque()
+
+    def _freeze_callable(self, runner):
+        frozen = copy.deepcopy(runner.get_inference_policy(device=self.device))  # detaches weights
+        def call(obs):
+            with torch.no_grad():
+                return frozen(obs)
+        return call
+
+    def save(self, runner):
+        self.buf.appendleft(self._freeze_callable(runner))
+        while len(self.buf) > self.cap:
+            self.buf.pop()
+
+    def sample(self):
+        if not self.buf:
+            return None
+        if len(self.buf) == 1 or random.random() < self.p_newest:
+            return self.buf[0]
+        return random.choice(list(self.buf)[1:])
 
 def check_lib():
     try:
@@ -132,7 +164,7 @@ def main():
     p.add_argument("-e","--exp_name", default="drone-hovering-selfplay")
     p.add_argument("-B","--num_envs", type=int, default=8192)
     p.add_argument("--max_iterations", type=int, default=5001)
-    p.add_argument("--alt_K", type=int, default=128)
+    p.add_argument("--alt_K", type=int, default=65)
     p.add_argument("-v","--vis", action="store_true", default=False)
     p.add_argument("--resume_ego", type=int, default=0)
     p.add_argument("--resume_adv", type=int, default=0)
@@ -176,23 +208,32 @@ def main():
     # bootstrap obs
     envE.reset(); envA.reset()
 
+    # setup opponent pools
+    adv_pool = OpponentPool(device=gs.device)
+    ego_pool = OpponentPool(device=gs.device)
+    # seed pools with the starting policies
+    adv_pool.save(runnerA)
+    ego_pool.save(runnerE)
+
     it = 0; K = max(1, args.alt_K)
     while it < args.max_iterations:
         # ego phase vs frozen adversary
-        polA = runnerA.get_inference_policy(device=gs.device)  # callable(obs)->act
-        envE.set_adversary_policy(polA)                        # env already supports this. :contentReference[oaicite:1]{index=1}
+        envE.set_opponent(adv_pool.sample())
         step = min(K, args.max_iterations - it); it += step
         runnerE.learn(num_learning_iterations=step, init_at_random_ep_len=True)
+        ego_pool.save(runnerE)
 
         if it >= args.max_iterations: break
 
         # adversary phase vs frozen ego
-        polE = runnerE.get_inference_policy(device=gs.device)
-        envA.set_ego_policy(polE)                              # tiny hook in env, see patch.
+        envA.set_opponent(ego_pool.sample())
         step = min(K, args.max_iterations - it); it += step
         runnerA.learn(num_learning_iterations=step, init_at_random_ep_len=True)
+        adv_pool.save(runnerA)
 
     print("done")
 
 if __name__ == "__main__":
     main()
+
+#TODO use additional non-recent "anchor" policies in the pools

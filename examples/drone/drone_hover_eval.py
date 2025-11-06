@@ -34,23 +34,18 @@ def main():
     gs.init(seed=1, performance_mode=True)
 
     log_dir = f"logs/{args.exp_name}"
+    log_dir_ego = os.path.join(log_dir, "ego")
+    log_dir_adv = os.path.join(log_dir, "adv")
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(open(f"{log_dir}/cfgs.pkl", "rb"))
 
-    # Make adversary a policy-driven drone.
-    env_cfg["adversary_control"] = "policy"
-    env_cfg["adversary_is_drone"] = True
-    env_cfg.setdefault("adv_drone_half_thickness", 0.05)
-    env_cfg["z_margin"] = 0.00
 
     # Eval-only safety and visuals.
     env_cfg["episode_length_s"] = 60.0
-    env_cfg["adv_max_v"] = 2.0
-    env_cfg["adv_min_v"] = 2.0
-    env_cfg["termination_if_tilt_greater_than"] = 170.0
-    env_cfg["termination_if_angvel_greater_than"] = 100.0
     env_cfg["visualize_target"] = True
     env_cfg["visualize_camera"] = args.record
     env_cfg["max_visualize_FPS"] = 60
+    env_cfg["eval"] = True
+#    env_cfg["z_margin"] = 0.00
 
     # Disable reward logging during eval.
     reward_cfg["reward_scales"] = {}
@@ -64,24 +59,22 @@ def main():
         show_viewer=True,
     )
 
-    resume_path = os.path.join(log_dir, f"model_{args.ckpt}.pt")
-
     # Important: deep-copy train_cfg BEFORE constructing any runner.
     train_cfg_ego = copy.deepcopy(train_cfg)
     train_cfg_adv = copy.deepcopy(train_cfg)
 
     # Ego policy.
-    runner_ego = OnPolicyRunner(env, train_cfg_ego, log_dir, device=gs.device)
-    runner_ego.load(resume_path)
+    runner_ego = OnPolicyRunner(env, train_cfg_ego, log_dir_ego, device=gs.device)
+    runner_ego.load(os.path.join(log_dir_ego, f"model_{args.ckpt}.pt"))
     policy_ego = runner_ego.get_inference_policy(device=gs.device)
 
     # Adversary policy (same checkpoint, independent state).
-    runner_adv = OnPolicyRunner(env, train_cfg_adv, log_dir, device=gs.device)
-    runner_adv.load(resume_path)
+    runner_adv = OnPolicyRunner(env, train_cfg_adv, log_dir_adv, device=gs.device)
+    runner_adv.load(os.path.join(log_dir_adv, f"model_{args.ckpt}.pt"))
     policy_adv = runner_adv.get_inference_policy(device=gs.device)
 
     # Plug adversary policy into the environment.
-    env.set_adversary_policy(policy_adv)
+    env.set_opponent(policy_adv)
 
     obs, _ = env.reset()
     max_sim_step = int(env_cfg["episode_length_s"] * env_cfg["max_visualize_FPS"])
