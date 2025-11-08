@@ -973,17 +973,21 @@ class HoverEnv:
     def _reward_smooth(self):
         return -torch.sum(torch.square(self.rew_actions - self.rew_last_actions), dim=1)
 
-    def _reward_ang_vel(self):
-        dist, _, _, _ = self.rew_app_geom
-        gate = self._gaussian_gate(dist)
-        gate_prev = self._gaussian_gate(self.rew_prev_dist)
+    def _reward_ang_acc(self):
         ang_norm = self.rew_ang_vel.norm(dim=1)
         yaw_abs = self.rew_ang_vel[:, 2].abs()
-        angvel_near_rew = gate_prev * self.rew_prev_ang_norm - gate * ang_norm
-        yaw_rew = (self.rew_prev_yaw_abs - yaw_abs)
+        ang_acc_rew = self.rew_prev_ang_norm - ang_norm
+        yaw_acc_rew = self.rew_prev_yaw_abs - yaw_abs
         self.rew_prev_ang_norm.copy_(ang_norm)
         self.rew_prev_yaw_abs.copy_(yaw_abs)
-        return angvel_near_rew + yaw_rew
+        return ang_acc_rew + yaw_acc_rew
+
+    def _reward_ang_vel(self):
+        ang_norm = self.rew_ang_vel.norm(dim=1)
+        yaw_abs = self.rew_ang_vel[:, 2].abs()
+        ang_vel_rew = - ang_norm
+        yaw_vel_rew = - yaw_abs
+        return ang_vel_rew + yaw_vel_rew
 
     def _reward_crash(self):
         crash = self.rew_crash_condition.float()

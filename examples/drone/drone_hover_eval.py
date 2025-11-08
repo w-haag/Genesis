@@ -44,7 +44,7 @@ def main():
     env_cfg["visualize_target"] = True
     env_cfg["visualize_camera"] = args.record
     env_cfg["max_visualize_FPS"] = 60
-    env_cfg["eval"] = True
+    env_cfg["eval"] = False
 #    env_cfg["z_margin"] = 0.00
 
     # Disable reward logging during eval.
