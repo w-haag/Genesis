@@ -341,8 +341,8 @@ class HoverEnv:
             base_quat=torch.zeros((self.num_envs, 4), device=gs.device, dtype=gs.tc_float),
             base_lin=dummy, base_ang=dummy,
             last_actions=torch.zeros((self.num_envs, self.num_actions), device=gs.device, dtype=gs.tc_float),
-            retarget_flag=torch.zeros((self.num_envs, 1), device=gs.device, dtype=gs.tc_float),
             extra_pos=dummy,
+            retarget_flag=torch.zeros((self.num_envs, 1), device=gs.device, dtype=gs.tc_float),
         ).shape[-1]
 
     def _concat_obs(self, **t):
@@ -359,8 +359,8 @@ class HoverEnv:
             torch.clip(t["base_lin"] * self.obs_scales["lin_vel"], -1, 1),
             torch.clip(t["base_ang"] * self.obs_scales["ang_vel"], -1, 1),
             t["last_actions"],
-            t["retarget_flag"],
             torch.clip(t["extra_pos"] * self.obs_scales["rel_pos"], -1, 1),
+            t["retarget_flag"],
         ], dim=-1)
 
     def _success_mask(self):
@@ -631,8 +631,8 @@ class HoverEnv:
             base_lin=self.base_lin_vel,
             base_ang=self.base_ang_vel,
             last_actions=self.last_actions,
-            retarget_flag=retarget_flag,
             extra_pos=extra_pos,
+            retarget_flag=retarget_flag,
         )
 
     def build_adv_obs(self):
@@ -652,8 +652,8 @@ class HoverEnv:
             base_lin=self.adv_lin_vel,
             base_ang=self.adv_ang_vel,
             last_actions=self.adv_last_actions,
-            retarget_flag=retarget_flag,
             extra_pos=extra_pos,
+            retarget_flag=retarget_flag,
         )
 
     def get_observations(self):
