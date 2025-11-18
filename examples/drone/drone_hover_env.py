@@ -132,28 +132,33 @@ class HoverEnv:
         # visual aids
         if self.env_cfg.get("visualize_target", False):
             self.target = self.scene.add_entity(
-                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.05, fixed=False, collision=False),
-                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.5, 0.5))),
-            )
-            self.target_threshold_highlight = self.scene.add_entity(
-                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.051, fixed=False, collision=False),
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=self.env_cfg["at_target_threshold"], fixed=False, collision=False),
                 surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.5, 0.75, 0.5))),
             )
+            self.target_threshold_highlight = self.scene.add_entity(
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=self.env_cfg["at_target_threshold"]+0.001, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.1, 0.75, 0.1))),
+            )
             self.target_reached_highlight = self.scene.add_entity(
-                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.052, fixed=False, collision=False),
-                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.0, 1.0, 0.0))),
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=self.env_cfg["at_target_threshold"]+0.002, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.1, 1.0, 0.1))),
             )
             # self.adv_target_marker = None
             self.adv_target_marker = self.scene.add_entity(
-                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=0.04, fixed=False, collision=False),
-                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.2, 0.4, 1.0))),
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=self.env_cfg["at_target_threshold"]*2, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(0.75, 0.5, 0.5))),
             )
-            self.highlight_hide = torch.tensor([0.0, 0.0, -1.0], device=gs.device, dtype=gs.tc_float)
+            self.adv_target_reached_marker = self.scene.add_entity(
+                morph=gs.morphs.Mesh(file="meshes/sphere.obj", scale=self.env_cfg["at_target_threshold"]*2, fixed=False, collision=False),
+                surface=gs.surfaces.Rough(diffuse_texture=gs.textures.ColorTexture(color=(1.0, 0.1, 0.1))),
+            )
+            self.highlight_hide = torch.tensor([0.0, 0.0, -2.0], device=gs.device, dtype=gs.tc_float)
         else:
             self.target = None
             self.target_threshold_highlight = None
             self.target_reached_highlight = None
             self.adv_target_marker = None
+            self.adv_target_reached_marker = None
 
         # drones
         self.drone = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf"))
@@ -197,7 +202,7 @@ class HoverEnv:
 
         # buffers: ego
         self.rew_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
-        self.reset_buf = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_int)
+        self.reset_buf = torch.ones((self.num_envs,), device=gs.device, dtype=torch.bool)
         self.episode_length_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
 
         # commands: adversary's moving setpoint; commands_adv: ego's target (adversary top)
@@ -245,10 +250,10 @@ class HoverEnv:
 
         # approach and shaping geometry
         self.app_geom = (
-            torch.zeros((self.num_envs), device=gs.device),
-            torch.zeros((self.num_envs, 3), device=gs.device),
-            torch.zeros((self.num_envs), device=gs.device),
-            torch.zeros((self.num_envs), device=gs.device),
+            torch.zeros((self.num_envs), device=gs.device, dtype=gs.tc_float),
+            torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float),
+            torch.zeros((self.num_envs), device=gs.device, dtype=gs.tc_float),
+            torch.zeros((self.num_envs), device=gs.device, dtype=gs.tc_float),
         )
         self.prev_dist = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
         self.prev_vel_close = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
@@ -257,10 +262,10 @@ class HoverEnv:
         self.prev_yaw_abs = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         self.adv_app_geom = (
-            torch.zeros((self.num_envs), device=gs.device),
-            torch.zeros((self.num_envs, 3), device=gs.device),
-            torch.zeros((self.num_envs), device=gs.device),
-            torch.zeros((self.num_envs), device=gs.device),
+            torch.zeros((self.num_envs), device=gs.device, dtype=gs.tc_float),
+            torch.zeros((self.num_envs, 3), device=gs.device, dtype=gs.tc_float),
+            torch.zeros((self.num_envs), device=gs.device, dtype=gs.tc_float),
+            torch.zeros((self.num_envs), device=gs.device, dtype=gs.tc_float),
         )
         self.adv_prev_dist = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
         self.adv_prev_vel_close = torch.zeros(self.num_envs, device=gs.device, dtype=gs.tc_float)
@@ -296,6 +301,8 @@ class HoverEnv:
         self.success = torch.zeros(self.num_envs, dtype=torch.bool, device=gs.device)
 
         self.extras = {"observations": {}}
+        self.extras["term_timeout"] = torch.zeros(self.num_envs, dtype=gs.tc_float, device=gs.device)
+        self.extras["term_causes_now"] = {}
 
         # moving path for adversary setpoint
         self.commands_anchor = torch.zeros_like(self.commands)
@@ -318,7 +325,8 @@ class HoverEnv:
         self.adv_tgt_acc_est = torch.zeros_like(self.tgt_vel)
 
         self.adv_stable_cnt = torch.zeros(self.num_envs, dtype=torch.int32, device=gs.device)
-        self.adv_n_stable = int(round(2*self.env_cfg["stable_time_s"] / self.dt))
+        # self.adv_n_stable = int(round(2*self.env_cfg["stable_time_s"] / self.dt)) #TODO decide
+        self.adv_n_stable = int(1)
         self.adv_success = torch.zeros(self.num_envs, dtype=torch.bool, device=gs.device)
 
     # ---------- public API ----------
@@ -371,7 +379,7 @@ class HoverEnv:
         return near# & slow & level & angvel
 
     def _adv_success_mask(self):
-        return self.adv_rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"]
+        return self.adv_rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"]*2
 
     def _gaussian_gate(self, dist, decay=None):
         if decay is None:
@@ -437,15 +445,18 @@ class HoverEnv:
 
         self.stable_cnt[envs_idx] = 0
         self.success[envs_idx] = False
+        self.adv_stable_cnt[envs_idx] = 0
+        self.adv_success[envs_idx] = False
 
     def _log_episode_stats(self, envs_idx):
         if len(envs_idx) == 0:
             return
         self.extras["episode"] = ep = {}
 
-        eps = 1e-6
-        inv_step = 1.0 / (self.m_step[envs_idx] + eps)
-        inv_near = 1.0 / (self.m_near_cnt[envs_idx] + eps)
+        m_step = self.m_step[envs_idx].to(torch.float32)
+        m_near = self.m_near_cnt[envs_idx].to(torch.float32)
+        inv_step = torch.where(m_step > 0, 1.0 / m_step, torch.zeros_like(m_step))
+        inv_near = torch.where(m_near > 0, 1.0 / m_near, torch.zeros_like(m_near))
 
         # metrics (mean over the just-reset subset, same names as single-drone env)
         d_mean_t = (self.m_d_sum[envs_idx]      * inv_step).mean()
@@ -478,17 +489,35 @@ class HoverEnv:
                 for k, v in zip(rew_keys, vals.detach().cpu().tolist()):
                     ep[f"rew_{k}"] = v
 
-        # termination histogram for those envs
-        ri = self.extras.get("term_reset_idx_now", None)
-        if ri is not None and len(ri) > 0:
-            for k, v in self.extras.get("term_causes_now", {}).items():
-                ep[k] = v[ri].mean().item()
-            ep["term_timeout"] = self.extras["term_timeout"][ri].mean().item()
+        # termination histogram
+        for k, v in self.extras.get("term_causes_now", {}).items():
+            ep[k] = v[envs_idx].mean().item()
+        ep["term_timeout"] = self.extras["term_timeout"][envs_idx].mean().item()
 
     def reset_idx(self, envs_idx):
         if len(envs_idx) == 0:
             return
+
+        # episode stats logging
+        self.extras["episode"] = {}
+
+        # --- log before clearing ---
+        self._log_episode_stats(envs_idx)
+
+        # --- clear accumulators (ego + adversary) ---
+        for t in [self.m_d_sum, self.m_step, self.m_inside_sum, self.m_vapp_err_sum,
+                self.m_near_cnt, self.m_vtan_sum, self.m_vtgt_sum, self.m_angvel_sum]:
+            t[envs_idx] = 0
+        for k in list(self.episode_sums.keys()):
+            self.episode_sums[k][envs_idx] = 0.0
+        for k in list(self.adv_episode_sums.keys()):
+            self.adv_episode_sums[k][envs_idx] = 0.0
         self.episode_length_buf[envs_idx] = 0
+        
+        # Clear termination flags to prevent them from carrying over to next episode
+        self.crash_condition[envs_idx] = False
+        self.adv_crash_condition[envs_idx] = False
+        self.adv_collision[envs_idx] = False
 
         # ego pose
         self.base_pos[envs_idx] = self.base_init_pos
@@ -507,31 +536,21 @@ class HoverEnv:
         self._resample_commands(envs_idx)
         self._respawn_adv(envs_idx)
 
-
-        # episode stats logging
-        self.extras["episode"] = {}
-
-        # --- log before clearing ---
-        self._log_episode_stats(envs_idx)
-
-        # --- clear accumulators (ego + adversary) ---
-        for t in [self.m_d_sum, self.m_step, self.m_inside_sum, self.m_vapp_err_sum,
-                self.m_near_cnt, self.m_vtan_sum, self.m_vtgt_sum, self.m_angvel_sum]:
-            t[envs_idx] = 0
-        for k in list(self.episode_sums.keys()):
-            self.episode_sums[k][envs_idx] = 0.0
-        for k in list(self.adv_episode_sums.keys()):
-            self.adv_episode_sums[k][envs_idx] = 0.0
-
-        # --- also reset adversary distance cache to avoid cross-episode spikes ---
-
     def _respawn_adv(self, envs_idx):
         if len(envs_idx) == 0:
             return
-        jitter_xy = 0.3
-        xy = torch.randn((len(envs_idx), 2), device=gs.device, dtype=gs.tc_float) * jitter_xy
-        adv_base = torch.zeros((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float)
-        adv_base[:, :2] = self.commands[envs_idx, :2] + xy
+
+        radius_sq_min   = self.env_cfg["adv_spawn_r_min"] * self.env_cfg["adv_spawn_r_min"]
+        radius_sq_max   = self.env_cfg["adv_spawn_r_max"] * self.env_cfg["adv_spawn_r_max"]
+        angle           = torch.rand((len(envs_idx)), device=gs.device, dtype=gs.tc_float) * math.tau
+        dist_frac       = torch.rand((len(envs_idx)), device=gs.device, dtype=gs.tc_float)
+
+        radius          = (radius_sq_min + (radius_sq_max - radius_sq_min) * dist_frac).sqrt_()
+        spawn_offset    = torch.view_as_real(torch.polar(radius, angle))
+
+        # spawn_offset = self.env_cfg["adv_spawn_r_min"] + (self.env_cfg["adv_spawn_r_max"] - self.env_cfg["adv_spawn_r_min"]) * torch.rand((len(envs_idx), 2), device=gs.device, dtype=gs.tc_float)
+        adv_base        = torch.zeros((len(envs_idx), 3), device=gs.device, dtype=gs.tc_float)
+        adv_base[:, :2] = self.commands[envs_idx, :2] + spawn_offset
         adv_base[:, 2]  = (self.commands[envs_idx, 2] + self.adv_base_offset[2])
 
         self.adv_pos[envs_idx] = adv_base
@@ -672,8 +691,8 @@ class HoverEnv:
         # update adversary setpoint path first
         t = self.episode_length_buf.unsqueeze(-1).to(self.path_f.dtype) * self.dt  # [N,1]
         path = self.path_a * torch.sin(math.tau * self.path_f * t + self.path_phi)
-        self.last_commands = self.commands
-        self.commands = self.commands_anchor + path
+        self.last_commands.copy_(self.commands)
+        self.commands.copy_(self.commands_anchor + path)
 
         # actions
         if self.train_role == "ego":
@@ -684,7 +703,10 @@ class HoverEnv:
                     adv_act = self.opponent(self.adv_obs_buf)
                 self.adv_actions = torch.clip(adv_act, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
             else:
-                self.adv_actions[:] = 0.0
+                with torch.no_grad():
+                    self.adv_actions.zero_()
+                    self.adversary.set_pos(self.commands, zero_velocity=True)
+                    self.adversary.set_quat(self.base_init_quat.repeat(self.num_envs, 1), zero_velocity=True)
         else:
             # PPO controls adversary; ego comes from frozen opponent
             self.adv_actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
@@ -693,9 +715,16 @@ class HoverEnv:
                     ego_act = self.opponent(self.obs_buf)
                 self.actions = torch.clip(ego_act, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
             else:
-                self.actions[:] = 0.0
+                with torch.no_grad():
+                    self.actions.zero_()
+                    self.drone.set_pos(self.base_init_pos.repeat(self.num_envs, 1), zero_velocity=True)
+                    self.drone.set_quat(self.base_init_quat.repeat(self.num_envs, 1), zero_velocity=True)
 
         # apply RPMs (14468 is hover)
+        nan_state = torch.isnan(self.actions).any(dim=1)
+        adv_nan_state = torch.isnan(self.adv_actions).any(dim=1)
+        self.actions.nan_to_num_(nan=0.0)
+        self.adv_actions.nan_to_num_(nan=0.0)
         self.drone.set_propellels_rpm((1 + self.actions * 0.7) * 14468.429183500699)
         self.adversary.set_propellels_rpm((1 + self.adv_actions * 0.9) * 14468.429183500699) # make adversary slightly faster - TODO check if it works
 
@@ -707,7 +736,15 @@ class HoverEnv:
         self.last_base_pos.copy_(self.base_pos)
         pos = self.drone.get_pos(); quat = self.drone.get_quat()
         lin = self.drone.get_vel(); ang = self.drone.get_ang()
-        pos.nan_to_num_(nan=0.0); quat.nan_to_num_(nan=0.0); lin.nan_to_num_(nan=0.0); ang.nan_to_num_(nan=0.0)
+
+        nan_state |= torch.isnan(pos).any(dim=1) | torch.isnan(quat).any(dim=1) \
+                   | torch.isnan(lin).any(dim=1) | torch.isnan(ang).any(dim=1)
+        # Replace NaNs with previous valid state (not zeros)
+        pos[nan_state]  = self.base_pos[nan_state]
+        quat[nan_state] = self.base_quat[nan_state]
+        lin[nan_state]  = 0.0
+        ang[nan_state]  = 0.0
+
         quat = quat / quat.norm(dim=1, keepdim=True).clamp_min(1e-6)
         inv_q = inv_quat(quat)
         self.base_pos.copy_(pos); self.base_quat.copy_(quat)
@@ -718,7 +755,15 @@ class HoverEnv:
         self.adv_last_pos.copy_(self.adv_pos)
         apos = self.adversary.get_pos(); aquat = self.adversary.get_quat()
         alin = self.adversary.get_vel(); aang = self.adversary.get_ang()
-        apos.nan_to_num_(nan=0.0); aquat.nan_to_num_(nan=0.0); alin.nan_to_num_(nan=0.0); aang.nan_to_num_(nan=0.0)
+        
+        adv_nan_state |= torch.isnan(apos).any(dim=1) | torch.isnan(aquat).any(dim=1) \
+                       | torch.isnan(alin).any(dim=1) | torch.isnan(aang).any(dim=1)
+        # Replace NaNs with previous valid state (not zeros)
+        apos[adv_nan_state]  = self.adv_pos[adv_nan_state]
+        aquat[adv_nan_state] = self.adv_quat[adv_nan_state]
+        alin[adv_nan_state]  = 0.0
+        aang[adv_nan_state]  = 0.0
+
         aquat = aquat / aquat.norm(dim=1, keepdim=True).clamp_min(1e-6)
         adv_inv_q = inv_quat(aquat)
         self.adv_pos.copy_(apos); self.adv_quat.copy_(aquat)
@@ -763,7 +808,8 @@ class HoverEnv:
 
         # contacts
         adv_contact = self.adversary.get_contacts(with_entity=self.drone, exclude_self_contact=True)
-        self.adv_collision = (adv_contact['penetration'] > 0).any(dim=1)
+        self.adv_collision = ((adv_contact['penetration'] > 0) & adv_contact["valid_mask"]).any(dim=1)
+        self.adv_collision &= self.episode_length_buf > 2 # guard against weird initial conditions
 
         # metrics
         d, u, vel_close, _ = self.app_geom
@@ -798,28 +844,33 @@ class HoverEnv:
         adv_floor_term = (self.adv_pos[:, 2] < self.env_cfg["termination_if_close_to_ground"])
 
         self.extras["term_causes_now"] = {
-            "term_tilt": tilt_term.float(),
-            "term_yaw": yaw_term.float(),
-            "term_floor": floor_term.float(),
+            "term_ego_tilt": tilt_term.float(),
+            "term_ego_yaw": yaw_term.float(),
+            "term_ego_floor": floor_term.float(),
             "term_collision": self.adv_collision.float(),
             "term_adv_tilt": adv_tilt_term.float(),
             "term_adv_yaw": adv_yaw_term.float(),
             "term_adv_floor": adv_floor_term.float(),
+            "term_ego_nan": nan_state.float(),
+            "term_adv_nan": adv_nan_state.float(),
         }
 
         if self.env_cfg["eval"]:
-            self.crash_condition = (tilt_term | yaw_term | floor_term | self.adv_collision)
-            self.adv_crash_condition = (adv_tilt_term | adv_yaw_term | adv_floor_term | self.adv_collision)
+            # self.crash_condition = (tilt_term | yaw_term | floor_term | self.adv_collision | nan_state)
+            # self.adv_crash_condition = (adv_tilt_term | adv_yaw_term | adv_floor_term | self.adv_collision | adv_nan_state)
+            self.crash_condition = (floor_term | nan_state)
+            self.adv_crash_condition = (adv_floor_term | adv_nan_state)
         else:
-            self.crash_condition = (floor_term | self.adv_collision)
-            self.adv_crash_condition = (adv_floor_term | self.adv_collision)
+            # self.crash_condition = (floor_term | self.adv_collision | nan_state)
+            # self.adv_crash_condition = (adv_floor_term | self.adv_collision | adv_nan_state)
+            self.crash_condition = (floor_term | nan_state)
+            self.adv_crash_condition = (adv_floor_term | adv_nan_state)
 
         self.stable_cnt = torch.where(success_mask, (self.stable_cnt + 1).clamp_max(self.n_stable), torch.zeros_like(self.stable_cnt))
         self.success = self.stable_cnt >= self.n_stable
         self.adv_stable_cnt = torch.where(adv_success_mask, (self.adv_stable_cnt + 1).clamp_max(self.adv_n_stable), torch.zeros_like(self.adv_stable_cnt))
         self.adv_success = self.adv_stable_cnt >= self.adv_n_stable
 
-        # visualize targets: red = ego target (adv top), blue = adversary setpoint
         if self.target is not None:
             near = (self.rel_pos.norm(dim=1) < self.env_cfg["at_target_threshold"])
             threshold_pos = torch.where(near.unsqueeze(1), self.commands_adv, self.highlight_hide)
@@ -827,8 +878,11 @@ class HoverEnv:
             self.target.set_pos(self.commands_adv, zero_velocity=True)
             self.target_threshold_highlight.set_pos(threshold_pos, zero_velocity=True)
             self.target_reached_highlight.set_pos(reached_pos, zero_velocity=True)
-            if self.adv_target_marker is not None:
-                self.adv_target_marker.set_pos(self.commands, zero_velocity=True)
+
+        if self.adv_target_marker is not None:
+            adv_reached_pos = torch.where(adv_success_mask.unsqueeze(1), self.commands, self.highlight_hide)
+            self.adv_target_marker.set_pos(self.commands, zero_velocity=True)
+            self.adv_target_reached_marker.set_pos(adv_reached_pos, zero_velocity=True)
 
         # rewards
         self.rewards_mapper()
@@ -853,33 +907,37 @@ class HoverEnv:
         else:
             crash = self.adv_crash_condition
             
-        self.reset_buf = (self.episode_length_buf > self.max_episode_length) | crash
-        time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).flatten()
-        self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=gs.device, dtype=gs.tc_float)
-        self.extras["time_outs"][time_out_idx] = 1.0
+        timeout = self.episode_length_buf >= self.max_episode_length
+        self.extras["term_timeout"] = timeout.to(dtype=gs.tc_float)
 
+        self.reset_buf = timeout | crash
         reset_idx_now = self.reset_buf.nonzero(as_tuple=False).flatten()
-        self.extras["term_timeout"] = torch.zeros_like(self.reset_buf, device=gs.device, dtype=gs.tc_float)
-        self.extras["term_timeout"][(self.episode_length_buf > self.max_episode_length)] = 1.0
         self.extras["term_reset_idx_now"] = reset_idx_now
 
         self.reset_idx(reset_idx_now)
 
         # resample after success
+        adv_envs_crash_idx = torch.nonzero(self.adv_crash_condition, as_tuple=False).flatten()
+        if len(adv_envs_crash_idx) > 0:
+            self._respawn_adv(adv_envs_crash_idx)
         adv_envs_idx = torch.nonzero(self.adv_success, as_tuple=False).flatten()
         if len(adv_envs_idx) > 0:
             self._resample_commands(adv_envs_idx)
             self._respawn_adv(adv_envs_idx)
         envs_idx = torch.nonzero(self.success, as_tuple=False).flatten()
         if len(envs_idx) > 0:
-            self._resample_commands(envs_idx)
+            # self._resample_commands(envs_idx)
             self._respawn_adv(envs_idx)
 
         # observations for next step
         obs_t = torch.clamp(torch.nan_to_num(self.build_obs(), nan=0.0, posinf=1e6, neginf=-1e6), -100.0, 100.0)
         adv_obs_t = torch.clamp(torch.nan_to_num(self.build_adv_obs(), nan=0.0, posinf=1e6, neginf=-1e6), -100.0, 100.0)
 
-        done = self.reset_buf.bool(); done[envs_idx] = True # adv success does not lead to done
+        done = self.reset_buf.clone()
+        if self.train_role == "ego":
+            done[envs_idx] = True
+        else:
+            done[adv_envs_idx] = True
         self.stacker.push(obs_t, done)
         self.adv_stacker.push(adv_obs_t, done)
         self.obs_buf = self.stacker.stacked()
@@ -952,13 +1010,13 @@ class HoverEnv:
 
     def _reward_adv_escape(self):
         dist = (self.base_pos - self.adv_pos).norm(dim=1)
-        gate = self._gaussian_gate(dist=dist, decay=self.env_cfg["near_gate_factor"]*self.env_cfg["at_target_threshold"])
+        gate = self._gaussian_gate(dist=dist, decay=self.env_cfg["near_gate_factor"]*self.env_cfg["at_target_threshold"]*2)
         return gate * -self._reward_approach(ego=True)
 
     def _reward_adv_approach(self):
         # deprioritize when ego is close
         dist = (self.base_pos - self.adv_pos).norm(dim=1)
-        gate = 1.0 - self._gaussian_gate(dist=dist, decay=self.env_cfg["near_gate_factor"]*self.env_cfg["at_target_threshold"])
+        gate = 1.0 - self._gaussian_gate(dist=dist, decay=self.env_cfg["near_gate_factor"]*self.env_cfg["at_target_threshold"]*2)
         return gate * self._reward_approach(ego=False)
 
     def _reward_tan_vel_align(self):

@@ -46,7 +46,7 @@ def get_train_cfg(exp_name, max_iterations):
         },
         "runner_class_name": "OnPolicyRunner",
         "num_steps_per_env": 100,
-        "save_interval": 50,
+        "save_interval": 200,
         "empirical_normalization": True,
         "seed": 1,
     }
@@ -69,7 +69,7 @@ def get_cfgs():
         "termination_if_close_to_ground": 0.1,
         "termination_if_yaw_rate_greater_than": 3.0,
         # success + shaping
-        "at_target_threshold": 0.10,
+        "at_target_threshold": 0.05,
         "max_rel_speed_mps": 0.2,
         "max_tilt_deg": 10.0,
         "max_angvel_radps": 1.5,
@@ -80,11 +80,13 @@ def get_cfgs():
         "tgo_cap": 3.0,
         "angvel_excess_margin_radps": 0.5,
         # adversary path + geometry # TODO curriculum has gone missing?!?
-        "adv_min_v": 0.0,
-        "adv_max_v": 0.0,
+        "adv_min_v": 0.5,
+        "adv_max_v": 1.0,
         "adv_max_f": 1.0,
         "z_margin": 0.05,
         "adv_drone_half_thickness": 0.05,
+        "adv_spawn_r_min": 0.5,
+        "adv_spawn_r_max": 1.0,
     }
     obs_cfg = {
         "obs_scales": {
@@ -95,31 +97,31 @@ def get_cfgs():
     }
     reward_cfg = {  # ego rewards (env auto-dt-scales non-events and sums into episode_sums)
         "reward_scales": {
-            "approach":         500.0,
-            "tan_vel_align":    100.0,
-            "smooth":           5.0,
-            "ang_vel":          25.0,
-            "ang_acc":          2.5,
+            "approach":         1000.0,
+            "tan_vel_align":    50.0,
+            "smooth":           2.5,
+            "ang_vel":          2.5,
+            "ang_acc":          0.5,
             "crash":            20.0,
             "success":          0.5,
-            "adv_success":      -1.0,
+            "adv_success":      -2.0,
         },
         "adv_reward_scales": {
-            "adv_approach":     500.0,
+            "adv_approach":     1000.0,
             "adv_escape":       500.0,
             "tan_vel_align":    50.0,
-            "smooth":           5.0,
-            "ang_vel":          25.0,
-            "ang_acc":          2.5,
+            "smooth":           2.5,
+            "ang_vel":          2.5,
+            "ang_acc":          0.5,
             "crash":            20.0,
             "success":          -0.5,
-            "adv_success":      1.0,
+            "adv_success":      2.0,
         }
     }
     command_cfg = {
         "num_commands": 3,
-        "pos_x_range":[-1,1],
-        "pos_y_range":[-1,1],
+        "pos_x_range":[-0.75,0.75],
+        "pos_y_range":[-0.75,0.75],
         "pos_z_range":[1,1]
     }
     return env_cfg, obs_cfg, reward_cfg, command_cfg
@@ -168,8 +170,8 @@ def main():
     p.add_argument("--max_iterations", type=int, default=5001)
     p.add_argument("--alt_K", type=int, default=65)
     p.add_argument("-v","--vis", action="store_true", default=False)
-    p.add_argument("--resume_ego", type=int, default=0)
-    p.add_argument("--resume_adv", type=int, default=0)
+    p.add_argument("--resume_ego", type=int, default=-1)
+    p.add_argument("--resume_adv", type=int, default=-1)
     args = p.parse_args()
 
     check_lib()
@@ -177,7 +179,7 @@ def main():
 
     root = f"logs/{args.exp_name}"
     ego_dir, adv_dir = os.path.join(root,"ego"), os.path.join(root,"adv")
-    if args.resume_ego==0 and args.resume_adv==0 and os.path.exists(root):
+    if args.resume_ego<0 and args.resume_adv<0 and os.path.exists(root):
         shutil.rmtree(root)
     os.makedirs(ego_dir, exist_ok=True); os.makedirs(adv_dir, exist_ok=True)
 
@@ -204,8 +206,8 @@ def main():
     runnerE = OnPolicyRunner(envE, tcfgE, ego_dir, device=gs.device)
     runnerA = OnPolicyRunner(envA, tcfgA, adv_dir, device=gs.device)
 
-    if args.resume_ego>0: runnerE.load(os.path.join(ego_dir, f"model_{args.resume_ego}.pt"))
-    if args.resume_adv>0: runnerA.load(os.path.join(adv_dir, f"model_{args.resume_adv}.pt"))
+    if args.resume_ego>=0: runnerE.load(os.path.join(ego_dir, f"model_{args.resume_ego}.pt"))
+    if args.resume_adv>=0: runnerA.load(os.path.join(adv_dir, f"model_{args.resume_adv}.pt"))
 
     # bootstrap obs
     envE.reset(); envA.reset()
@@ -222,7 +224,7 @@ def main():
         # ego phase vs frozen adversary
         envE.set_opponent(adv_pool.sample())
         step = min(K, args.max_iterations - it); it += step
-        runnerE.learn(num_learning_iterations=step, init_at_random_ep_len=True)
+        runnerE.learn(num_learning_iterations=step, init_at_random_ep_len=False)
         ego_pool.save(runnerE)
 
         if it >= args.max_iterations: break
@@ -230,7 +232,7 @@ def main():
         # adversary phase vs frozen ego
         envA.set_opponent(ego_pool.sample())
         step = min(K, args.max_iterations - it); it += step
-        runnerA.learn(num_learning_iterations=step, init_at_random_ep_len=True)
+        runnerA.learn(num_learning_iterations=step, init_at_random_ep_len=False)
         adv_pool.save(runnerA)
 
     print("done")
