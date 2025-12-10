@@ -95,7 +95,7 @@ class HoverEnv:
         self.num_commands = command_cfg["num_commands"]
         self.device = gs.device
 
-        self.simulate_action_latency = env_cfg.get("simulate_action_latency", False)
+        self.simulate_action_latency = env_cfg.get("simulate_action_latency", False) # TODO
         self.dt = 0.01
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
 
@@ -325,8 +325,7 @@ class HoverEnv:
         self.adv_tgt_acc_est = torch.zeros_like(self.tgt_vel)
 
         self.adv_stable_cnt = torch.zeros(self.num_envs, dtype=torch.int32, device=gs.device)
-        # self.adv_n_stable = int(round(2*self.env_cfg["stable_time_s"] / self.dt)) #TODO decide
-        self.adv_n_stable = int(1)
+        self.adv_n_stable = int(round(self.env_cfg["stable_time_adv_s"] / self.dt))
         self.adv_success = torch.zeros(self.num_envs, dtype=torch.bool, device=gs.device)
 
     # ---------- public API ----------
@@ -847,22 +846,18 @@ class HoverEnv:
             "term_ego_tilt": tilt_term.float(),
             "term_ego_yaw": yaw_term.float(),
             "term_ego_floor": floor_term.float(),
-            "term_collision": self.adv_collision.float(),
+            "term_ego_nan": nan_state.float(),
             "term_adv_tilt": adv_tilt_term.float(),
             "term_adv_yaw": adv_yaw_term.float(),
             "term_adv_floor": adv_floor_term.float(),
-            "term_ego_nan": nan_state.float(),
             "term_adv_nan": adv_nan_state.float(),
+            "term_collision": self.adv_collision.float(),
         }
 
         if self.env_cfg["eval"]:
-            # self.crash_condition = (tilt_term | yaw_term | floor_term | self.adv_collision | nan_state)
-            # self.adv_crash_condition = (adv_tilt_term | adv_yaw_term | adv_floor_term | self.adv_collision | adv_nan_state)
-            self.crash_condition = (floor_term | nan_state)
-            self.adv_crash_condition = (adv_floor_term | adv_nan_state)
+            self.crash_condition = (tilt_term | yaw_term | floor_term | nan_state | self.adv_collision)
+            self.adv_crash_condition = (adv_tilt_term | adv_yaw_term | adv_floor_term | adv_nan_state | self.adv_collision)
         else:
-            # self.crash_condition = (floor_term | self.adv_collision | nan_state)
-            # self.adv_crash_condition = (adv_floor_term | self.adv_collision | adv_nan_state)
             self.crash_condition = (floor_term | nan_state)
             self.adv_crash_condition = (adv_floor_term | adv_nan_state)
 
@@ -1009,6 +1004,7 @@ class HoverEnv:
         return phi(dist_prev, vel_close_prev) - phi(dist, vel_close)
 
     def _reward_adv_escape(self):
+        # deprioritize when ego is far
         dist = (self.base_pos - self.adv_pos).norm(dim=1)
         gate = self._gaussian_gate(dist=dist, decay=self.env_cfg["near_gate_factor"]*self.env_cfg["at_target_threshold"]*2)
         return gate * -self._reward_approach(ego=True)
