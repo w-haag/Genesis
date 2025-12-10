@@ -74,6 +74,7 @@ def get_cfgs():
         "max_tilt_deg": 10.0,
         "max_angvel_radps": 1.5,
         "stable_time_s": 0.10,
+        "stable_time_adv_s": 0.05,
         "approach_k": 2.0,
         "approach_v_cap": 1.0,
         "near_gate_factor": 2.0,
@@ -83,10 +84,10 @@ def get_cfgs():
         "adv_min_v": 0.5,
         "adv_max_v": 1.0,
         "adv_max_f": 1.0,
-        "z_margin": 0.05,
+        "z_margin": 0.25,
         "adv_drone_half_thickness": 0.05,
-        "adv_spawn_r_min": 0.5,
-        "adv_spawn_r_max": 1.0,
+        "adv_spawn_r_min": 1.0,
+        "adv_spawn_r_max": 1.5,
     }
     obs_cfg = {
         "obs_scales": {
@@ -167,7 +168,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("-e","--exp_name", default="drone-hovering-selfplay")
     p.add_argument("-B","--num_envs", type=int, default=8192)
-    p.add_argument("--max_iterations", type=int, default=5001)
+    p.add_argument("-M","--max_iterations", type=int, default=5001)
     p.add_argument("--alt_K", type=int, default=65)
     p.add_argument("-v","--vis", action="store_true", default=False)
     p.add_argument("--resume_ego", type=int, default=-1)

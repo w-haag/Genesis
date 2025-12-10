@@ -41,16 +41,10 @@ def main():
 
     # Eval-only safety and visuals.
     env_cfg["episode_length_s"] = 20.0
-    env_cfg["at_target_threshold"] = 0.05
-    env_cfg["adv_spawn_r_min"] = 1.0
-    env_cfg["adv_spawn_r_max"] = 1.5
-    env_cfg["adv_min_v"] = 0.1
-    env_cfg["adv_max_v"] = 0.5
     env_cfg["visualize_target"] = True
     env_cfg["visualize_camera"] = args.record
     env_cfg["max_visualize_FPS"] = 60
     env_cfg["eval"] = False
-    env_cfg["z_margin"] = 0.25
 
     # Disable reward logging during eval.
     reward_cfg["reward_scales"] = {}
